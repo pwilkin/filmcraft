@@ -124,6 +124,48 @@ fn ingest_copies_and_creates_proxies_on_import() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Regression (security): the ingest destination comes from the project file, so ingest must
+/// never overwrite a file that is already there, and never make an executable copy.
+#[test]
+fn ingest_never_overwrites_and_never_copies_exec_bits() {
+    let root = tmp_dir("proxy-ingest-safe");
+    let cards = root.join("Card");
+    std::fs::create_dir_all(&cards).unwrap();
+    let a = cards.join("A001.mov");
+    make_movie(&a, DemoScene::Forest, W, H, 4);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let dest = root.join("bin");
+    std::fs::create_dir_all(&dest).unwrap();
+    let victim = dest.join("A001.mov");
+    std::fs::write(&victim, b"#!/bin/sh\necho mine\n").unwrap();
+    let mut s = Session::default();
+    s.execute("project.ingestSettings", json!({"enabled": true, "action": "copy", "destination": dest.to_string_lossy()})).unwrap();
+    let r = s.execute("file.import", json!({"paths": [a.to_string_lossy()]})).unwrap();
+    let item = filmcraft_project::ItemId(r["items"][0].as_u64().unwrap());
+    assert_eq!(std::fs::read(&victim).unwrap(), b"#!/bin/sh\necho mine\n", "the existing file is untouched");
+    let copy = dest.join("A001 (1).mov");
+    let m = s.project.item(item).unwrap().as_media().unwrap();
+    assert_eq!(m.media, filmcraft_project::MediaRef::File { path: copy.to_string_lossy().into_owned() }, "{r}");
+    assert_eq!(std::fs::read(&copy).unwrap(), std::fs::read(&a).unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&copy).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0, "copy is not executable: {mode:o}");
+    }
+    // importing the same media again reuses the identical copy instead of making another
+    let r = s.execute("file.import", json!({"paths": [a.to_string_lossy()]})).unwrap();
+    let item2 = filmcraft_project::ItemId(r["items"][0].as_u64().unwrap());
+    let m2 = s.project.item(item2).unwrap().as_media().unwrap();
+    assert_eq!(m2.media, filmcraft_project::MediaRef::File { path: copy.to_string_lossy().into_owned() });
+    assert!(!dest.join("A001 (2).mov").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Measure: Program-monitor playback cost of 4K H.264 with and without proxies (sequential frames
 /// at ½ resolution). Run with `RAYON_NUM_THREADS=1` so wall time ≈ CPU time:
 /// `cargo test --release -p filmcraft-engine proxy_playback_perf_4k -- --ignored --nocapture`.

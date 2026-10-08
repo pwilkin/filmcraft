@@ -213,6 +213,12 @@ pub fn start_job(s: &mut Session, label: String, work: Vec<(ItemId, String, &'st
             if let Some(d) = Path::new(&out).parent() {
                 let _ = std::fs::create_dir_all(d);
             }
+            // the name was free when the job was planned: never replace (or later remove) a file
+            // that appeared since
+            if std::fs::symlink_metadata(&out).is_ok() {
+                err = Some(format!("{name}: {out} already exists"));
+                break;
+            }
             match transcode(&clip, &name, src, None, &out, pr, &prog) {
                 Ok(r) => {
                     bytes += r.bytes;
@@ -376,6 +382,53 @@ pub fn create(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"job": job, "preset": pr.id, "outputs": outputs, "skipped": skipped}))
 }
 
+/// Most `name (n).ext` alternatives tried when an ingest copy's name is taken.
+const MAX_INGEST_NAMES: u32 = 1000;
+
+/// Copy `src` into `dir` as `fname` for ingest. The destination comes from the project file, so
+/// this never overwrites anything: an existing file with the same content is reused, otherwise
+/// the copy gets the first free `name (n).ext`. The copy is a new file (`create_new`) with default
+/// permissions, so an executable source never yields an executable copy.
+fn ingest_copy(services: &dyn crate::Services, src: &str, dir: &Path, fname: &str, identity: &filmcraft_project::MediaIdentity) -> Result<PathBuf> {
+    let (stem, ext) = match fname.rsplit_once('.') {
+        Some((st, e)) if !st.is_empty() => (st, Some(e)),
+        _ => (fname, None),
+    };
+    for n in 0..=MAX_INGEST_NAMES {
+        let name = match (n, ext) {
+            (0, _) => fname.to_string(),
+            (n, Some(e)) => format!("{stem} ({n}).{e}"),
+            (n, None) => format!("{stem} ({n})"),
+        };
+        let out = dir.join(&name);
+        match copy_new(src, &out) {
+            Ok(()) => return Ok(out),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // the same media already ingested: use it (only a regular file, never a symlink)
+                let regular = std::fs::symlink_metadata(&out).is_ok_and(|m| m.file_type().is_file());
+                if regular && crate::relink::identity_of(services, &out.to_string_lossy()).is_ok_and(|b| b == *identity) {
+                    return Ok(out);
+                }
+            }
+            Err(e) => return Err(EngineError::Other(format!("copying {fname}: {e}"))),
+        }
+    }
+    Err(EngineError::Other(format!("copying {fname}: {} already has {MAX_INGEST_NAMES} files with that name", dir.display())))
+}
+
+/// Copy `src` to a new file `out` (fails with `AlreadyExists` instead of replacing anything). The
+/// copy does not keep the source's permission bits; a partial copy is removed.
+fn copy_new(src: &str, out: &Path) -> std::io::Result<()> {
+    let mut from = std::fs::File::open(src)?;
+    let mut to = std::fs::OpenOptions::new().write(true).create_new(true).open(out)?;
+    let r = std::io::copy(&mut from, &mut to).and_then(|_| to.sync_all());
+    if r.is_err() {
+        drop(to);
+        let _ = std::fs::remove_file(out);
+    }
+    r
+}
+
 /// Ingest freshly imported items per the project's ingest settings.
 pub fn ingest(s: &mut Session, items: &[ItemId]) -> Result<Value> {
     let ing = s.project.settings.ingest.clone();
@@ -392,20 +445,21 @@ pub fn ingest(s: &mut Session, items: &[ItemId]) -> Result<Value> {
                 _ => Path::new(&path).parent().unwrap_or(Path::new(".")).join("Ingested Media"),
             };
             let fname = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let out = dir.join(&fname);
-            if Path::new(&path) == out {
+            if Path::new(&path) == dir.join(&fname) {
                 continue;
             }
             std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
-            std::fs::copy(&path, &out).map_err(|e| EngineError::Other(format!("copying {fname}: {e}")))?;
+            let a = crate::relink::identity_of(&*s.services, &path).map_err(|e| EngineError::Other(e.to_string()))?;
+            let out = ingest_copy(&*s.services, &path, &dir, &fname, &a)?;
             let out_s = out.to_string_lossy().into_owned();
             // verify the copy before switching to it
-            let a = crate::relink::identity_of(&*s.services, &path).map_err(|e| EngineError::Other(e.to_string()))?;
             let b = crate::relink::identity_of(&*s.services, &out_s).map_err(|e| EngineError::Other(e.to_string()))?;
             if a != b {
                 return Err(EngineError::Other(format!("the copy of {fname} doesn't match the original")));
             }
-            crate::relink::relink(s, &json!({"item": i.0, "path": out_s, "relinkOthers": false}))?;
+            // a copy renamed to avoid a clash (`name (1).ext`) is still the verified same content
+            let same_name = out.file_name().is_some_and(|n| n.to_string_lossy() == fname);
+            crate::relink::relink(s, &json!({"item": i.0, "path": out_s, "relinkOthers": false, "match": {"fileName": same_name}}))?;
             copied.push(json!({"item": i.0, "path": out_s}));
         }
     }

@@ -415,6 +415,60 @@ fn media_cache_location_policy_and_clean() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Regression (security): the media cache may point at a folder full of the user's own media;
+/// Delete… and the automatic policies must only ever delete FilmCraft's own preview files.
+#[test]
+fn media_cache_never_deletes_user_files() {
+    let dir = tmp_dir("prefs-cache-user");
+    let mut s = Session::default();
+    s.start_autosave(crate::autosave::AutosaveConfig::new(dir.join("data"))).unwrap();
+    let videos = dir.join("Videos");
+    std::fs::create_dir_all(videos.join("Holiday")).unwrap();
+    let ten_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86_400);
+    let user_files = [
+        videos.join("my-video.mov"),
+        videos.join("Holiday").join("beach.mov"),
+        // even named like a preview, outside an `untitled-*` session folder it is not ours
+        videos.join("0123456789abcdef0123456789abcdef.mov"),
+        videos.join("Previews").join("0123456789abcdef0123456789abcdef.mov"),
+        videos.join("Previews").join("untitled-1-ff").join("notes.txt"),
+    ];
+    for f in &user_files {
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, b"precious").unwrap();
+        std::fs::File::options().write(true).open(f).unwrap().set_modified(ten_days_ago).unwrap();
+    }
+    set(&mut s, "mediaCache.location", json!(videos.to_string_lossy()));
+    let ours = videos.join("Previews").join("untitled-1-ff").join("fedcba9876543210fedcba9876543210.mov");
+    std::fs::write(&ours, b"render").unwrap();
+    std::fs::File::options().write(true).open(&ours).unwrap().set_modified(ten_days_ago).unwrap();
+    // only FilmCraft's file is counted
+    let info = s.execute("mediaCache.info", json!({})).unwrap();
+    assert_eq!(info["files"], 1);
+    let p = settings::MediaCachePrefs { management: "olderThan".into(), older_than_days: 1, ..Default::default() };
+    assert_eq!(settings::enforce_policy(&videos, &p, None, std::time::SystemTime::now()), (1, 6));
+    assert!(!ours.exists());
+    let p = settings::MediaCachePrefs { management: "exceedsSize".into(), max_size_gb: 0, ..Default::default() };
+    settings::enforce_policy(&videos, &p, None, std::time::SystemTime::now());
+    s.execute("mediaCache.clean", json!({"all": true})).unwrap();
+    for f in &user_files {
+        assert!(f.exists(), "{} was deleted", f.display());
+    }
+    // a symlinked session folder is not followed
+    #[cfg(unix)]
+    {
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("00000000000000000000000000000000.mov");
+        std::fs::write(&victim, b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, videos.join("Previews").join("untitled-2-aa")).unwrap();
+        s.execute("mediaCache.clean", json!({"all": true})).unwrap();
+        assert!(victim.exists());
+    }
+    s.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn output_mapping_and_smart_quotes() {
     let (l, r) = ([0.5f32, 0.25], [-0.5f32, 1.5]);

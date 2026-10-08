@@ -1236,31 +1236,57 @@ pub fn previews_root(cache: &Path) -> PathBuf {
     cache.join("Previews")
 }
 
-/// Files under `dir` (recursively): (path, bytes, modified).
+/// A real (non-symlink) directory at `p`.
+fn is_real_dir(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir())
+}
+
+/// A per-session preview folder FilmCraft creates under `<cache>/Previews` (`untitled-<pid>-<hex>`).
+fn is_preview_session_dir(name: &str) -> bool {
+    name.strip_prefix("untitled-").is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
+/// A preview render file FilmCraft writes: `<32 hex>.mov|.wav`, or its `.part` while rendering.
+fn is_preview_file(name: &str) -> bool {
+    let base = name.strip_suffix(".part").unwrap_or(name);
+    base.strip_suffix(".mov").or_else(|| base.strip_suffix(".wav")).is_some_and(|h| h.len() == 32 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The FilmCraft-owned files in the media cache at `dir`: (path, bytes, modified). Only render
+/// previews in `<dir>/Previews/untitled-*/` named the way FilmCraft names them count; anything
+/// else (the cache may point at a folder holding the user's own media) is never listed, so it is
+/// never deleted. Symlinks are never followed and the walk is a fixed two levels deep.
 fn cache_files(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
     let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            let Ok(md) = e.metadata() else { continue };
-            if md.is_dir() {
-                stack.push(e.path());
-            } else {
-                out.push((e.path(), md.len(), md.modified().unwrap_or(std::time::UNIX_EPOCH)));
+    let root = previews_root(dir);
+    if !is_real_dir(&root) {
+        return out;
+    }
+    let Ok(rd) = std::fs::read_dir(&root) else { return out };
+    for sub in rd.flatten() {
+        // DirEntry::file_type does not follow symlinks
+        if !sub.file_type().is_ok_and(|t| t.is_dir()) || !is_preview_session_dir(&sub.file_name().to_string_lossy()) {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(sub.path()) else { continue };
+        for e in files.flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_file()) || !is_preview_file(&e.file_name().to_string_lossy()) {
+                continue;
             }
+            let Ok(md) = std::fs::symlink_metadata(e.path()) else { continue };
+            out.push((e.path(), md.len(), md.modified().unwrap_or(std::time::UNIX_EPOCH)));
         }
     }
     out
 }
 
-/// Size and file count of the media cache.
+/// Size and file count of the media cache (FilmCraft's own files).
 pub fn cache_usage(dir: &Path) -> (u64, usize) {
     let f = cache_files(dir);
-    (f.iter().map(|x| x.1).sum(), f.len())
+    (f.iter().fold(0u64, |a, x| a.saturating_add(x.1)), f.len())
 }
 
-/// Remove files under `dir`, skipping anything inside `keep`; returns (files, bytes) removed.
+/// Remove `files`, skipping anything inside `keep`; returns (files, bytes) removed.
 fn remove_files(files: &[(PathBuf, u64, std::time::SystemTime)], keep: Option<&Path>) -> (usize, u64) {
     let mut n = (0usize, 0u64);
     for (p, len, _) in files {
@@ -1269,21 +1295,24 @@ fn remove_files(files: &[(PathBuf, u64, std::time::SystemTime)], keep: Option<&P
         }
         if std::fs::remove_file(p).is_ok() {
             n.0 += 1;
-            n.1 += len;
+            n.1 = n.1.saturating_add(*len);
         }
     }
     n
 }
 
+/// Remove the empty preview session folders under `<dir>/Previews` (never `keep` or its parents).
+/// `remove_dir` only succeeds on empty folders, symlinks are skipped and nothing deeper is walked.
 fn prune_empty_dirs(dir: &Path, keep: Option<&Path>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let root = previews_root(dir);
+    if !is_real_dir(&root) {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(&root) else { return };
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_dir() && keep.is_none_or(|k| !k.starts_with(&p)) {
-            prune_empty_dirs(&p, keep);
+        if e.file_type().is_ok_and(|t| t.is_dir()) && is_preview_session_dir(&e.file_name().to_string_lossy()) && keep.is_none_or(|k| !k.starts_with(&p)) {
             let _ = std::fs::remove_dir(&p);
-        } else if p.is_dir() {
-            prune_empty_dirs(&p, keep);
         }
     }
 }
@@ -1294,13 +1323,13 @@ pub fn enforce_policy(dir: &Path, prefs: &MediaCachePrefs, keep: Option<&Path>, 
     let mut files = cache_files(dir);
     let removed = match prefs.management.as_str() {
         "olderThan" => {
-            let max_age = std::time::Duration::from_secs(prefs.older_than_days as u64 * 86_400);
+            let max_age = std::time::Duration::from_secs((prefs.older_than_days as u64).saturating_mul(86_400));
             let old: Vec<_> = files.into_iter().filter(|f| now.duration_since(f.2).is_ok_and(|a| a > max_age)).collect();
             remove_files(&old, keep)
         }
         "exceedsSize" => {
-            let limit = prefs.max_size_gb as u64 * 1_000_000_000;
-            let mut total: u64 = files.iter().map(|f| f.1).sum();
+            let limit = (prefs.max_size_gb as u64).saturating_mul(1_000_000_000);
+            let mut total: u64 = files.iter().fold(0u64, |a, f| a.saturating_add(f.1));
             files.sort_by_key(|f| f.2);
             let mut doomed = Vec::new();
             for f in files {
@@ -1310,7 +1339,7 @@ pub fn enforce_policy(dir: &Path, prefs: &MediaCachePrefs, keep: Option<&Path>, 
                 if keep.is_some_and(|k| f.0.starts_with(k)) {
                     continue;
                 }
-                total -= f.1;
+                total = total.saturating_sub(f.1);
                 doomed.push(f);
             }
             remove_files(&doomed, keep)
@@ -1321,7 +1350,7 @@ pub fn enforce_policy(dir: &Path, prefs: &MediaCachePrefs, keep: Option<&Path>, 
     removed
 }
 
-/// Delete everything in the media cache except `keep` ("Delete…" ▸ unused files).
+/// Delete FilmCraft's files in the media cache except `keep` ("Delete…" ▸ unused files).
 pub fn clean(dir: &Path, keep: Option<&Path>) -> (usize, u64) {
     let files = cache_files(dir);
     let r = remove_files(&files, keep);

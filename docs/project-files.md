@@ -222,7 +222,7 @@ opens the dialog on a page.
 | Labels | the 16 label names and colours (timeline, Project panel, Edit ▸ Label), label defaults for imported movies / video / audio / stills and new sequences |
 | Media | Indeterminate Media Timebase (frame rate of stills), Default Media Scaling (Scale to / Set to frame size when a clip of another size is edited in), Enable proxies |
 | Media Analysis & Transcription | auto-transcribe imported clips (scope "all imported"), speech model, default language / auto-detect, speaker labelling (defaults of `transcript.generate`) |
-| Media Cache | location (`<data dir>/Media Cache` by default; unsaved projects' render previews live there), automatic deletion (older than N days / beyond N GB), Delete… (`mediaCache.clean {all?}`, `mediaCache.info`) |
+| Media Cache | location (`<data dir>/Media Cache` by default; unsaved projects' render previews live there), automatic deletion (older than N days / beyond N GB), Delete… (`mediaCache.clean {all?}`, `mediaCache.info`). Deletion and the reported size cover only FilmCraft's own files (render previews `<32 hex>.mov`/`.wav` in `Previews/untitled-*/`); other files in the folder are never touched and symlinks are never followed |
 | Memory | frame cache budget of the monitors and thumbnails |
 | Playback | preroll / postroll (Play Around, trim loop), Step forward/back many |
 | Plugins | stub (no plugins) |
@@ -352,7 +352,11 @@ Create Proxies dialog ids: `proxies.preset.<id>`, `proxies.destination`, `proxie
 destination?, preset?}` (Project Settings ▸ Ingest) acts on every `file.import`:
 
 - **copy** copies the file to the destination (default `<media folder>/Ingested Media`), checks the
-  copy's fingerprint against the original, and then uses the copy;
+  copy's fingerprint against the original, and then uses the copy. The destination comes from the
+  project file, so ingest never overwrites: a file already there with the same content is reused,
+  any other gets the copy beside it as `name (1).ext` (`(2)`, … up to 1000). Copies are new files
+  with default permissions (an executable source never gives an executable copy); proxies and
+  transcodes also refuse to write over a file that appeared after their name was chosen;
 - **transcode** writes the preset's format (default ProRes 422 LT) in the background and switches the
   clip to the result when it is done;
 - **createProxies** makes proxies in the background and attaches them;
