@@ -483,3 +483,53 @@ fn a_master_clip_used_by_an_earlier_sequence_still_lands_in_its_bin() {
     assert_ne!(bin, p.root.id, "the take was left loose at the top");
     assert_eq!(p.root.find_bin(bin).unwrap().name, "Comedy");
 }
+
+fn xmeml(children: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE xmeml>\n<xmeml version=\"4\"><project><name>P</name><children>{children}</children></project></xmeml>"
+    )
+}
+
+/// A sequence with one clip on each of `tracks` video tracks.
+fn many_tracks(tracks: usize) -> String {
+    let rate = "<rate><timebase>25</timebase><ntsc>FALSE</ntsc></rate>";
+    let track = format!("<track><clipitem><name>c</name>{rate}<start>0</start><end>10</end><in>0</in><out>10</out><file id=\"f\"/></clipitem></track>");
+    let file = format!("<file id=\"f\"><name>a.mov</name><pathurl>file://localhost/a.mov</pathurl>{rate}<duration>100</duration></file>");
+    xmeml(&format!(
+        "<clip><name>a</name><media><video><track><clipitem><name>a</name>{file}</clipitem></track></video></media></clip><sequence><name>S</name>{rate}<media><video>{}</video></media></sequence>",
+        track.repeat(tracks)
+    ))
+}
+
+/// Bins and inline sequences nested without end recursed once per level (a stack overflow at
+/// 100 000 levels, inside the XML parser too): such documents are refused, and nesting the parser
+/// can read is bounded by the importer.
+#[test]
+fn deep_nesting_is_bounded() {
+    let run = || {
+        let bins = |n: usize| xmeml(&format!("{}{}", "<bin><name>B</name><children>".repeat(n), "</children></bin>".repeat(n)));
+        assert!(import(bins(100_000).as_bytes(), Format::Fcp7Xml, None).is_err());
+        let with_sequence = bins(200).replace("<children><bin>", "<children><sequence><name>S</name><media><video><track/></video></media></sequence><bin>");
+        let (_, rep) = import(with_sequence.as_bytes(), Format::Fcp7Xml, None).unwrap();
+        assert!(rep.entries.iter().any(|e| e.message.contains("bins nested deeper")), "{rep:?}");
+        // a clip item whose inline sequence holds a clip item with an inline sequence…
+        let rate = "<rate><timebase>25</timebase><ntsc>FALSE</ntsc></rate>";
+        let open =
+            format!("<sequence><name>S</name>{rate}<media><video><track><clipitem><name>c</name>{rate}<start>0</start><end>10</end><in>0</in><out>10</out>");
+        let close = "</clipitem></track></video></media></sequence>";
+        let doc = xmeml(&format!("{}{}", open.repeat(100), close.repeat(100)));
+        assert!(import(doc.as_bytes(), Format::Fcp7Xml, None).is_ok());
+        let doc = xmeml(&format!("{}{}", open.repeat(20_000), close.repeat(20_000)));
+        assert!(import(doc.as_bytes(), Format::Fcp7Xml, None).is_err());
+    };
+    std::thread::Builder::new().stack_size(2 * 1024 * 1024).spawn(run).unwrap().join().unwrap();
+}
+
+/// Track counts are capped (a damaged file can hold any number of `<track>` elements).
+#[test]
+fn track_count_is_capped() {
+    let (imp, rep) = import(many_tracks(1_500).as_bytes(), Format::Fcp7Xml, None).unwrap();
+    let s = imp.sequences.iter().find_map(|i| imp.project.sequence(*i)).unwrap();
+    assert_eq!(s.video_tracks.len(), 999);
+    assert!(rep.entries.iter().any(|e| e.message.contains("tracks beyond")), "{rep:?}");
+}

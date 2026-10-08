@@ -274,31 +274,20 @@ pub(crate) fn media_clip(media: MediaRef, info: MediaInfo) -> MediaClip {
 
 /// The file path behind an item (following subclips), if it is file media.
 pub(crate) fn item_path(p: &Project, id: ItemId) -> Option<&str> {
-    match &p.item(id)?.kind {
-        ItemKind::Media(m) => match &m.media {
-            MediaRef::File { path } => Some(path),
-            MediaRef::Generator(_) => None,
-        },
-        ItemKind::Subclip { parent, .. } => item_path(p, *parent),
-        _ => None,
+    match &p.subclip_media(id)?.1.media {
+        MediaRef::File { path } => Some(path),
+        MediaRef::Generator(_) => None,
     }
 }
 
 /// The media clip behind an item (following subclips).
 pub(crate) fn item_media(p: &Project, id: ItemId) -> Option<&MediaClip> {
-    match &p.item(id)?.kind {
-        ItemKind::Media(m) => Some(m),
-        ItemKind::Subclip { parent, .. } => item_media(p, *parent),
-        _ => None,
-    }
+    p.subclip_media(id).map(|(_, m)| m)
 }
 
 /// The underlying item for exports (subclip → parent media).
 pub(crate) fn base_item(p: &Project, id: ItemId) -> ItemId {
-    match p.item(id).map(|i| &i.kind) {
-        Some(ItemKind::Subclip { parent, .. }) => base_item(p, *parent),
-        _ => id,
-    }
+    p.subclip_root(id).unwrap_or(id)
 }
 
 /// How an export report names a clip whose source is a graphic (title) or an adjustment layer,
@@ -323,6 +312,10 @@ pub(crate) fn generator_of(p: &Project, id: ItemId) -> Option<&Generator> {
 // ---------------------------------------------------------------------------------------------
 // Fragment builder
 // ---------------------------------------------------------------------------------------------
+
+/// Most tracks of one kind an importer gives a sequence (a damaged file can name absurd track
+/// numbers or lanes; Premiere itself allows far fewer).
+pub(crate) const MAX_TRACKS: usize = 999;
 
 pub(crate) struct Builder {
     pub p: Project,
@@ -395,12 +388,15 @@ impl Builder {
         Track::new(id, kind, name)
     }
 
-    pub fn ensure_tracks(&mut self, seq: &mut Sequence, kind: TrackKind, n: usize) {
-        while seq.tracks(kind).len() < n {
+    /// Grow the `kind` tracks of `seq` to at least `n` (at most [`MAX_TRACKS`]: a damaged file
+    /// can name absurd track numbers). Whether the sequence now has `n` tracks.
+    pub fn ensure_tracks(&mut self, seq: &mut Sequence, kind: TrackKind, n: usize) -> bool {
+        while seq.tracks(kind).len() < n.min(MAX_TRACKS) {
             let i = seq.tracks(kind).len();
             let t = self.track(kind, i);
             seq.tracks_mut(kind).push(t);
         }
+        seq.tracks(kind).len() >= n
     }
 
     pub fn link_id(&mut self) -> u64 {
@@ -448,19 +444,19 @@ impl Builder {
     }
 
     /// Place `item` on the first track at or after `preferred` where it does not overlap anything,
-    /// creating tracks as needed. Returns the track index.
-    pub fn place(&mut self, seq: &mut Sequence, kind: TrackKind, preferred: usize, item: TrackItem) -> usize {
-        let mut i = preferred;
-        loop {
-            self.ensure_tracks(seq, kind, i + 1);
-            let t = &mut seq.tracks_mut(kind)[i];
+    /// creating tracks as needed. Returns the track index, `None` (the item is dropped) when no
+    /// track up to [`MAX_TRACKS`] has room.
+    pub fn place(&mut self, seq: &mut Sequence, kind: TrackKind, preferred: usize, item: TrackItem) -> Option<usize> {
+        for i in preferred.min(MAX_TRACKS.saturating_sub(1))..MAX_TRACKS {
+            self.ensure_tracks(seq, kind, i.saturating_add(1));
+            let t = seq.tracks_mut(kind).get_mut(i)?;
             if !t.items.iter().any(|o| o.start < item.end() && item.start < o.end()) {
                 t.items.push(item);
                 t.sort();
-                return i;
+                return Some(i);
             }
-            i += 1;
         }
+        None
     }
 
     /// Finish: grow media durations to cover every use, return the fragment.

@@ -342,3 +342,77 @@ proptest! {
         prop_assert_eq!(links(&imp.project, si), links(&p, s));
     }
 }
+
+/// A minimal FCPXML document whose spine holds `body`; asset `r2` is a video+audio clip.
+fn hostile(body: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.10">
+  <resources>
+    <format id="r1" frameDuration="1/25s" width="1920" height="1080"/>
+    <asset id="r2" name="A" start="0s" duration="100s" hasVideo="1" hasAudio="1" format="r1"><media-rep kind="original-media" src="a.mov"/></asset>
+  </resources>
+  <library><event name="E"><project name="P"><sequence format="r1" tcStart="0s"><spine>{body}</spine></sequence></project></event></library>
+</fcpxml>"#
+    )
+}
+
+/// `lane="2000000000"` made one track per lane index (out of memory), and extreme lanes overflowed
+/// `lane + l` / `-lane - 1`: lanes clamp now, and tracks are capped.
+#[test]
+fn absurd_lanes_are_clamped() {
+    for lane in ["2000000000", "-2147483648", "2147483647", "-2000000000"] {
+        let body = format!(
+            r#"<asset-clip ref="r2" name="Main" offset="0s" start="0s" duration="1s" lane="5">
+                 <asset-clip ref="r2" lane="{lane}" name="Up" offset="0s" start="0s" duration="1s"/>
+               </asset-clip>
+               <asset-clip ref="r2" name="Main2" offset="1s" start="0s" duration="1s">
+                 <asset-clip ref="r2" lane="{lane}" name="Up" offset="0s" start="0s" duration="1s">
+                   <asset-clip ref="r2" lane="{lane}" name="Up2" offset="0s" start="0s" duration="1s"/>
+                 </asset-clip>
+               </asset-clip>"#
+        );
+        let (imp, _) = import(hostile(&body).as_bytes(), Format::Fcpxml, None).unwrap();
+        let s = imp.project.sequence(only_seq(&imp)).unwrap();
+        assert!(s.video_tracks.len() <= 110 && s.audio_tracks.len() <= 110, "{lane}: {} / {}", s.video_tracks.len(), s.audio_tracks.len());
+    }
+}
+
+/// Connected clips nested 400 deep (well inside what the XML parser reads) recursed once per
+/// level and placed each on a higher lane; nesting and lanes are bounded now. Deeper documents
+/// are refused before parsing (roxmltree itself recurses per element).
+#[test]
+fn deeply_nested_connected_clips_are_bounded() {
+    let run = || {
+        let n = 400;
+        let body = format!(
+            r#"<asset-clip ref="r2" name="Main" offset="0s" start="0s" duration="1s">{}{}</asset-clip>"#,
+            r#"<asset-clip lane="1" ref="r2" name="C" offset="0s" start="0s" duration="1s">"#.repeat(n),
+            "</asset-clip>".repeat(n)
+        );
+        let (imp, rep) = import(hostile(&body).as_bytes(), Format::Fcpxml, None).unwrap();
+        let s = imp.project.sequence(only_seq(&imp)).unwrap();
+        // each nested clip overlaps the others, so each needs a track: as many as the nesting read
+        assert!(s.video_tracks.len() <= 300, "{}", s.video_tracks.len());
+        assert!(rep.entries.iter().any(|e| e.message.contains("nested too deep")), "{rep:?}");
+        let n = 100_000;
+        let body = format!("{}{}", r#"<spine lane="1">"#.repeat(n), "</spine>".repeat(n));
+        assert!(import(hostile(&body).as_bytes(), Format::Fcpxml, None).is_err());
+    };
+    std::thread::Builder::new().stack_size(4 * 1024 * 1024).spawn(run).unwrap().join().unwrap();
+}
+
+/// A compound clip that uses itself recursed until the stack overflowed.
+#[test]
+fn a_compound_clip_that_contains_itself_is_skipped() {
+    let run = || {
+        let doc = hostile(r#"<ref-clip ref="r6" name="Loop" offset="0s" start="0s" duration="1s"/>"#).replace(
+            "</resources>",
+            r#"<media id="r6" name="Loop"><sequence format="r1"><spine><ref-clip ref="r6" name="Loop" offset="0s" start="0s" duration="1s"/></spine></sequence></media></resources>"#,
+        );
+        let (_, rep) = import(doc.as_bytes(), Format::Fcpxml, None).unwrap();
+        assert!(rep.entries.iter().any(|e| e.message.contains("contains itself")), "{rep:?}");
+    };
+    std::thread::Builder::new().stack_size(1024 * 1024).spawn(run).unwrap().join().unwrap();
+}

@@ -369,3 +369,25 @@ fn a_multicam_clip_showing_itself_plans_and_renders_to_an_end() {
     let img = render_sequence(&p, a, Tick::ZERO, opts, &sources);
     assert!(img.w > 0 && img.h > 0);
 }
+
+/// A sequence of 100 000 × 4 294 967 295 pixels (a damaged project) sized the canvas from the
+/// unchecked product (an out-of-memory abort, or a wrapped size): image sides are capped now.
+#[test]
+fn absurd_frame_sizes_are_bounded() {
+    assert_eq!(Image::new(100_000, 100_000).px.len(), 0);
+    assert_eq!((Image::new(usize::MAX / 2, 3).w, Image::new(3, usize::MAX).h), (0, 0));
+    assert!(Image::try_filled(100_000, 2, [1.0; 4]).is_none());
+    assert_eq!(Image::filled(2, 3, [1.0; 4]).px.len(), 24);
+    assert_eq!(Image::new(0, 0).get_clamped(5, 5), [0.0; 4]);
+    let (mut p, red, _, seq, map) = setup();
+    place(&mut p, seq, 0, red, 0, 48);
+    let s = p.sequence_mut(seq).unwrap();
+    s.settings.width = u32::MAX;
+    s.settings.height = 100_000;
+    let q = p.sequence(seq).unwrap();
+    assert_eq!(output_size(q, 1.0), (image::MAX_IMAGE_SIDE, image::MAX_IMAGE_SIDE));
+    assert_eq!(output_size(q, f32::NAN), (1, 1));
+    // a tiny scale keeps the render cheap while the width still clamps
+    let img = render_sequence(&p, seq, Tick(1000), RenderOptions { scale: 0.000_01, ..Default::default() }, &map);
+    assert_eq!((img.w, img.h), (image::MAX_IMAGE_SIDE, 1));
+}

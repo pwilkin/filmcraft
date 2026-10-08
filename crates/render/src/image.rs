@@ -10,16 +10,43 @@ pub struct Image {
     pub px: Vec<f32>,
 }
 
-impl Image {
-    pub fn new(w: usize, h: usize) -> Self {
-        Self { w, h, px: vec![0.0; w * h * 4] }
+/// Largest image side the compositor allocates (the largest frame side a sequence may have).
+pub const MAX_IMAGE_SIDE: usize = filmcraft_project::MAX_FRAME_SIDE as usize;
+/// Most pixels the compositor allocates for one image (the largest frame a sequence may have).
+pub const MAX_IMAGE_PIXELS: u64 = filmcraft_project::MAX_FRAME_PIXELS;
+
+/// Number of f32s in a `w`×`h` RGBA image, `None` past [`MAX_IMAGE_SIDE`] or [`MAX_IMAGE_PIXELS`].
+fn px_len(w: usize, h: usize) -> Option<usize> {
+    if w > MAX_IMAGE_SIDE || h > MAX_IMAGE_SIDE || (w as u64).checked_mul(h as u64)? > MAX_IMAGE_PIXELS {
+        return None;
     }
+    w.checked_mul(h)?.checked_mul(4)
+}
+
+impl Image {
+    /// A transparent `w`×`h` image. A side above [`MAX_IMAGE_SIDE`] (or more than [`MAX_IMAGE_PIXELS`]) yields an empty (0×0) image
+    /// instead of an unbounded (or wrapped) allocation: callers go by `w` / `h`.
+    pub fn new(w: usize, h: usize) -> Self {
+        match px_len(w, h) {
+            // zeroed allocation (lazily mapped): no fill pass over a large frame
+            Some(n) => Self { w, h, px: vec![0.0; n] },
+            None => Self { w: 0, h: 0, px: Vec::new() },
+        }
+    }
+    /// A `w`×`h` image of colour `c` (see [`Image::new`] for oversized requests).
     pub fn filled(w: usize, h: usize, c: [f32; 4]) -> Self {
-        let mut px = Vec::with_capacity(w * h * 4);
+        Self::try_filled(w, h, c).unwrap_or(Self { w: 0, h: 0, px: Vec::new() })
+    }
+    /// A `w`×`h` image of colour `c`, `None` when it is larger than [`Image::new`] allows or the
+    /// memory is not available.
+    pub fn try_filled(w: usize, h: usize, c: [f32; 4]) -> Option<Self> {
+        let n = px_len(w, h)?;
+        let mut px = Vec::new();
+        px.try_reserve_exact(n).ok()?;
         for _ in 0..w * h {
             px.extend_from_slice(&c);
         }
-        Self { w, h, px }
+        Some(Self { w, h, px })
     }
     #[inline]
     pub fn get(&self, x: usize, y: usize) -> [f32; 4] {
@@ -29,6 +56,9 @@ impl Image {
     /// Clamp-to-edge fetch.
     #[inline]
     pub fn get_clamped(&self, x: isize, y: isize) -> [f32; 4] {
+        if self.w == 0 || self.h == 0 {
+            return [0.0; 4];
+        }
         let x = x.clamp(0, self.w as isize - 1) as usize;
         let y = y.clamp(0, self.h as isize - 1) as usize;
         self.get(x, y)

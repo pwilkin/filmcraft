@@ -443,3 +443,23 @@ fn clear_deletes_a_bin_with_everything_in_it() {
     s.execute("project.delete", json!({"items": [root]})).unwrap();
     assert_eq!(s.project.items.len(), before);
 }
+
+/// A damaged project whose subclips loop must not recurse forever in `media_of` (it overflowed the
+/// stack, e.g. while evaluating whether the Clip menu commands are enabled).
+#[test]
+fn looped_subclips_have_no_media() {
+    use filmcraft_project::{Label, Project};
+    use filmcraft_time::TimeRange;
+    let run = || {
+        let mut p = Project::new("t");
+        let r = TimeRange::default();
+        let a = p.add_item("A", Label::Iris, ItemKind::Subclip { parent: ItemId(0), range: r, restrict_trims: false }, None);
+        let b = p.add_item("B", Label::Iris, ItemKind::Subclip { parent: a, range: r, restrict_trims: false }, None);
+        if let Some(ItemKind::Subclip { parent, .. }) = p.item_mut(a).map(|i| &mut i.kind) {
+            *parent = b;
+        }
+        assert!(super::media_of(&p, a).is_none());
+        assert!(super::media_of(&p, b).is_none());
+    };
+    std::thread::Builder::new().stack_size(256 * 1024).spawn(run).unwrap().join().unwrap();
+}

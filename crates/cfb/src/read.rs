@@ -71,7 +71,8 @@ impl<'a> CompoundFile<'a> {
         }
         let version = u16_at(data, 26);
         let shift = u16_at(data, 30);
-        if !(7..=16).contains(&shift) {
+        // §2.2: 512-byte sectors (version 3) or 4096-byte sectors (version 4), nothing else
+        if !matches!(shift, 9 | 12) {
             return Err(invalid(format!("sector shift {shift}")));
         }
         let mini_shift = u16_at(data, 32);
@@ -169,12 +170,15 @@ impl<'a> CompoundFile<'a> {
         let mut out = Vec::new();
         let mut s = start;
         let mut steps = 0usize;
+        // a chain visits each sector of the file at most once: more steps means it loops (and
+        // each step appends a whole sector, so the FAT's length alone is no bound)
+        let max_steps = self.fat.len().min(self.data.len() / self.sector_size + 1).max(1);
         while s != ENDOFCHAIN {
             if s > MAXREGSECT {
                 return Err(invalid(format!("bad sector {s:#x} in a chain")));
             }
             steps += 1;
-            if steps > self.fat.len().max(1) {
+            if steps > max_steps {
                 return Err(invalid("sector chain loops"));
             }
             let b = self.sector(s)?;

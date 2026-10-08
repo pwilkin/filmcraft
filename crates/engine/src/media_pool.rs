@@ -484,4 +484,26 @@ mod tests {
         assert!(matches!(MediaPool::default().open_file(&missing, &crate::FsServices), Err(MediaError::Offline(_))));
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// A damaged project whose subclips loop must not recurse forever (it overflowed the stack).
+    #[test]
+    fn looped_subclips_resolve_to_nothing() {
+        use filmcraft_project::{ItemKind, Label};
+        use filmcraft_time::TimeRange;
+        let run = || {
+            let mut p = Project::new("t");
+            let r = TimeRange::default();
+            let a = p.add_item("A", Label::Iris, ItemKind::Subclip { parent: ItemId(0), range: r, restrict_trims: false }, None);
+            let b = p.add_item("B", Label::Iris, ItemKind::Subclip { parent: a, range: r, restrict_trims: false }, None);
+            if let Some(ItemKind::Subclip { parent, .. }) = p.item_mut(a).map(|i| &mut i.kind) {
+                *parent = b;
+            }
+            let pool = MediaPool::default();
+            let host = ReaderOnly(Arc::from(Vec::new()));
+            assert!(pool.source_for(&p, a, &host).is_none());
+            assert!(pool.full_res_source(&p, b, &host).is_none());
+            assert!(crate::media_duration(&p, &pool, a).is_none());
+        };
+        std::thread::Builder::new().stack_size(256 * 1024).spawn(run).unwrap().join().unwrap();
+    }
 }

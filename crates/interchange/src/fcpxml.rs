@@ -14,7 +14,7 @@
 //!   clip markers. Transitions are supported on the primary storyline (and read from secondary
 //!   storylines); transitions elsewhere are reported.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use filmcraft_geom::Vec2;
 use filmcraft_media::MediaKind;
@@ -133,7 +133,16 @@ struct Imp<'a, 'i, 'r> {
     media_nodes: HashMap<String, Node<'a, 'i>>,
     media_items: HashMap<String, ItemId>,
     effects: HashMap<String, String>,
+    /// compound clips (`<media>`) being laid out: one that uses itself is skipped
+    media_open: HashSet<String>,
+    /// nesting of connected storylines / compound clips being laid out ([`MAX_DEPTH`])
+    depth: usize,
 }
+
+/// Deepest nesting of connected clips, secondary storylines and compound clips that is imported.
+const MAX_DEPTH: usize = 256;
+/// Highest lane (either way) a connected clip is placed on; FCP itself stays far below.
+const MAX_LANE: i32 = 99;
 
 /// Placement context of a storyline element.
 struct Ctx {
@@ -164,6 +173,8 @@ pub(crate) fn import(text: &str, opts: &ImportOptions, report: &mut Report) -> R
         media_nodes: HashMap::new(),
         media_items: HashMap::new(),
         effects: HashMap::new(),
+        media_open: HashSet::new(),
+        depth: 0,
     };
     if let Some(res) = child(root, "resources") {
         for r in elements(res) {
@@ -281,9 +292,17 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         }
         let n = *self.media_nodes.get(id)?;
         let s = child(n, "sequence")?;
-        // Reserve first so recursion terminates.
+        // a compound clip that (through others) uses itself, or nests absurdly deep, is skipped
+        if self.depth >= MAX_DEPTH || self.media_open.contains(id) {
+            self.report.warn("a compound clip that contains itself (or nests too deep) was skipped");
+            return None;
+        }
         let name = n.attribute("name").unwrap_or("Compound Clip").to_string();
+        self.media_open.insert(id.into());
+        self.depth += 1;
         let item = self.sequence(s, &name, None);
+        self.depth -= 1;
+        self.media_open.remove(id);
         self.media_items.insert(id.into(), item);
         Some(item)
     }
@@ -433,18 +452,23 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
                 if !primary || kind == TrackKind::Audio {
                     ti.markers = self.markers(el, local_start, src_in, speed);
                 }
+                // lanes are clamped to ±MAX_LANE where they are read; never negate i32::MIN
+                let lane = lane.clamp(-MAX_LANE, MAX_LANE);
                 let pref = match kind {
-                    TrackKind::Video => lane.max(0) as usize,
+                    TrackKind::Video => lane.max(0).unsigned_abs() as usize,
                     TrackKind::Audio => {
                         if lane < 0 {
-                            (-lane - 1) as usize
+                            lane.unsigned_abs().saturating_sub(1) as usize
                         } else {
-                            lane as usize
+                            lane.unsigned_abs() as usize
                         }
                     }
                 };
                 let id = ti.id;
-                self.b.place(seq, kind, pref, ti);
+                if self.b.place(seq, kind, pref, ti).is_none() {
+                    self.report.warn("a clip was skipped: the sequence has too many tracks");
+                    continue;
+                }
                 placed.push((kind, id));
                 if kind == TrackKind::Video {
                     vclip = Some(id);
@@ -457,12 +481,21 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
                 seq.markers.push(Marker { start: t0 + m.start, ..m });
             }
         }
-        // Connected clips and secondary storylines.
+        // Connected clips and secondary storylines (nesting bounded: a damaged file can nest
+        // them without end).
+        if self.depth >= MAX_DEPTH {
+            if elements(el).any(|c| c.attribute("lane").is_some()) {
+                self.report.warn("connected clips nested too deep were skipped");
+            }
+            return (t0 + dur, vclip);
+        }
+        self.depth += 1;
         for c in elements(el) {
             let Some(l) = c.attribute("lane").and_then(|l| l.parse::<i32>().ok()) else { continue };
+            let l = l.clamp(-MAX_LANE, MAX_LANE);
             let off = attr_time(c, "offset").unwrap_or(Tick::ZERO);
             let ct0 = t0 + (off - local_start);
-            let clane = if lane > 0 && l > 0 { lane + l } else { l };
+            let clane = if lane > 0 && l > 0 { lane.saturating_add(l).min(MAX_LANE) } else { l };
             if c.has_tag_name("spine") {
                 // Secondary storyline: children offsets are in the storyline's local time.
                 let first = elements(c).filter(|x| !x.has_tag_name("transition")).find_map(|x| attr_time(x, "offset")).unwrap_or(Tick::ZERO);
@@ -471,6 +504,7 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
                 self.element(seq, ctx, c, ct0, clane, false);
             }
         }
+        self.depth -= 1;
         let _ = placed;
         (t0 + dur, vclip)
     }

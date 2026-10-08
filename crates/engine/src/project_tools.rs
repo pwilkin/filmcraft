@@ -368,7 +368,7 @@ fn targets(s: &Session, p: &Value) -> Vec<ItemId> {
     out
 }
 
-/// The media clip behind an item (subclips resolve to their parent).
+/// The media clip behind an item (subclips resolve to their parent, bounded against loops).
 fn media_of(p: &Project, id: ItemId) -> Option<(ItemId, &filmcraft_project::MediaClip)> {
     p.resolve_media(id).map(|(root, media, _)| (root, media))
 }

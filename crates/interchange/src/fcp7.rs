@@ -112,6 +112,9 @@ struct Imp<'a, 'i, 'r> {
     xml_clip_ids: HashMap<(ItemId, String), ClipId>,
 }
 
+/// Deepest nesting of bins, and of sequences nested inline in clip items, that is imported.
+const MAX_DEPTH: usize = 128;
+
 fn node_key(n: Node) -> String {
     match n.attribute("id") {
         Some(id) => id.to_string(),
@@ -148,7 +151,7 @@ pub(crate) fn import(text_in: &str, opts: &ImportOptions, report: &mut Report) -
             _ => {}
         }
     }
-    imp.walk_container(root, None, true);
+    imp.walk_container(root, None, true, 0);
     imp.resolve_links();
     if imp.b.p.items.is_empty() {
         return Err(Error::Empty);
@@ -158,19 +161,23 @@ pub(crate) fn import(text_in: &str, opts: &ImportOptions, report: &mut Report) -
 
 impl<'a, 'i> Imp<'a, 'i, '_> {
     /// Walk `xmeml`, `project`, `bin` and `children` containers.
-    fn walk_container(&mut self, n: Node<'a, 'i>, bin: Option<BinId>, top: bool) {
+    fn walk_container(&mut self, n: Node<'a, 'i>, bin: Option<BinId>, top: bool, depth: usize) {
+        if depth > MAX_DEPTH {
+            self.report.warn(format!("bins nested deeper than {MAX_DEPTH} levels were skipped"));
+            return;
+        }
         for c in elements(n) {
             match c.tag_name().name() {
                 "project" => {
                     let target = c.children().find(|x| x.has_tag_name("children")).unwrap_or(c);
-                    self.walk_container(target, bin, top);
+                    self.walk_container(target, bin, top, depth + 1);
                 }
-                "children" => self.walk_container(c, bin, top),
+                "children" => self.walk_container(c, bin, top, depth + 1),
                 "bin" => {
                     let name = child_text(c, "name").unwrap_or("Bin");
                     let b = self.b.bin(name, bin);
                     let target = child(c, "children").unwrap_or(c);
-                    self.walk_container(target, Some(b), top);
+                    self.walk_container(target, Some(b), top, depth + 1);
                 }
                 "sequence" => {
                     if let Some(id) = self.sequence(c, bin)
@@ -285,6 +292,11 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
             return Some(*id);
         }
         let def = if child(n, "media").is_some() { n } else { *self.seq_defs.get(&key)? };
+        // `in_progress` holds the sequences being read: its size is the nesting depth
+        if self.in_progress.len() >= MAX_DEPTH {
+            self.report.warn(format!("sequences nested deeper than {MAX_DEPTH} levels were skipped"));
+            return None;
+        }
         if !self.in_progress.insert(key.clone()) {
             self.report.warn("recursive nested sequence ignored");
             return None;
@@ -318,7 +330,10 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         for (kind, tag) in [(TrackKind::Video, "video"), (TrackKind::Audio, "audio")] {
             let Some(m) = media.and_then(|m| child(m, tag)) else { continue };
             for (ti, tn) in children(m, "track").enumerate() {
-                self.b.ensure_tracks(&mut seq, kind, ti + 1);
+                if !self.b.ensure_tracks(&mut seq, kind, ti + 1) {
+                    self.report.warn("tracks beyond the most a sequence can have were skipped");
+                    break;
+                }
                 self.track(&mut seq, id, kind, ti, tn, rate, (w, h));
             }
         }
@@ -335,11 +350,9 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
 
     #[allow(clippy::too_many_arguments)]
     fn track(&mut self, seq: &mut Sequence, seq_id: ItemId, kind: TrackKind, ti: usize, tn: Node<'a, 'i>, rate: FrameRate, frame: (u32, u32)) {
-        {
-            let t = &mut seq.tracks_mut(kind)[ti];
-            t.enabled = child_bool(tn, "enabled").unwrap_or(true);
-            t.locked = child_bool(tn, "locked").unwrap_or(false);
-        }
+        let Some(t) = seq.tracks_mut(kind).get_mut(ti) else { return };
+        t.enabled = child_bool(tn, "enabled").unwrap_or(true);
+        t.locked = child_bool(tn, "locked").unwrap_or(false);
         let mut trans_nodes = Vec::new();
         for c in elements(tn) {
             match c.tag_name().name() {
@@ -350,10 +363,12 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
                         if !refs.is_empty() {
                             self.links.push(PendingLink { seq: seq_id, kind, track: ti, clip: ti_item.id, refs });
                         }
-                        let t = &mut seq.tracks_mut(kind)[ti];
+                        let Some(t) = seq.tracks_mut(kind).get_mut(ti) else { continue };
                         if t.items.iter().any(|o| o.start < ti_item.end() && ti_item.start < o.end()) {
                             self.report.warn("overlapping clip items on one track; the later one was moved to a new track");
-                            self.b.place(seq, kind, ti + 1, ti_item);
+                            if self.b.place(seq, kind, ti + 1, ti_item).is_none() {
+                                self.report.warn("a clip was skipped: the sequence has too many tracks");
+                            }
                         } else {
                             t.items.push(ti_item);
                         }
@@ -363,7 +378,9 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
                 _ => {}
             }
         }
-        seq.tracks_mut(kind)[ti].sort();
+        if let Some(t) = seq.tracks_mut(kind).get_mut(ti) {
+            t.sort();
+        }
         for c in trans_nodes {
             self.transition(seq, kind, ti, c, rate);
         }
@@ -597,7 +614,7 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         let name = eff.and_then(|x| child_text(x, "name")).or_else(|| eff.and_then(|x| child_text(x, "effectid"))).unwrap_or("Cross Dissolve");
         let effect = transition_effect(name, kind == TrackKind::Audio, self.report);
         let align_s = child_text(c, "alignment").unwrap_or("").to_ascii_lowercase();
-        let track = &mut seq.tracks_mut(kind)[ti];
+        let Some(track) = seq.tracks_mut(kind).get_mut(ti) else { return };
         let (mut from, mut to) = (None, None);
         if align_s != "start-black" {
             from = track.items.iter().filter(|i| i.end() >= s && i.end() <= e).max_by_key(|i| i.end()).map(|i| (i.id, i.end()));

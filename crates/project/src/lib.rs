@@ -252,6 +252,9 @@ impl MediaClip {
     }
 }
 
+/// Most `Subclip { parent }` links [`Project::subclip_root`] follows (subclips of subclips).
+pub const MAX_SUBCLIP_HOPS: usize = 16;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum ItemKind {
@@ -1593,20 +1596,32 @@ impl Project {
     /// adjustment layer or graphic; a subclip has the size of its parent. `None` without
     /// picture. This is the size the renderer centres a clip's "auto" anchor in.
     pub fn source_size(&self, item: ItemId) -> Option<(u32, u32)> {
+        match &self.item(self.subclip_root(item)?)?.kind {
+            ItemKind::Media(m) => m.info.video.as_ref().map(|v| (v.width, v.height)),
+            ItemKind::Sequence(q) => Some((q.settings.width, q.settings.height)),
+            ItemKind::AdjustmentLayer { width, height, .. } | ItemKind::Graphic { width, height, .. } => Some((*width, *height)),
+            ItemKind::Subclip { .. } => None,
+        }
+    }
+
+    /// The item a subclip shows: follows `Subclip { parent }` links to the first item that is not
+    /// a subclip (`item` itself when it isn't one). `None` when an item is missing or the chain is
+    /// longer than [`MAX_SUBCLIP_HOPS`]; a damaged project can point a subclip at itself.
+    pub fn subclip_root(&self, item: ItemId) -> Option<ItemId> {
         let mut id = item;
-        // subclips of subclips: bounded, a damaged project could point a subclip at itself
-        for _ in 0..16 {
-            return match &self.item(id)?.kind {
-                ItemKind::Media(m) => m.info.video.as_ref().map(|v| (v.width, v.height)),
-                ItemKind::Sequence(q) => Some((q.settings.width, q.settings.height)),
-                ItemKind::AdjustmentLayer { width, height, .. } | ItemKind::Graphic { width, height, .. } => Some((*width, *height)),
-                ItemKind::Subclip { parent, .. } => {
-                    id = *parent;
-                    continue;
-                }
-            };
+        for _ in 0..=MAX_SUBCLIP_HOPS {
+            match &self.item(id)?.kind {
+                ItemKind::Subclip { parent, .. } => id = *parent,
+                _ => return Some(id),
+            }
         }
         None
+    }
+
+    /// The media item behind `item` (a subclip resolves through [`Project::subclip_root`]).
+    pub fn subclip_media(&self, item: ItemId) -> Option<(ItemId, &MediaClip)> {
+        let root = self.subclip_root(item)?;
+        self.item(root)?.as_media().map(|m| (root, m))
     }
 
     /// Resolve the "auto" (NaN) points of the clips in the sequences `sequences` selects, for
@@ -1645,15 +1660,8 @@ impl Project {
     /// [`Project::source_size`] of `item` when the item that carries the size (the media item of
     /// a subclip) passes `size_is_final`.
     fn final_source_size(&self, item: ItemId, size_is_final: &impl Fn(&ProjectItem) -> bool) -> Option<(u32, u32)> {
-        let mut id = item;
-        for _ in 0..16 {
-            let it = self.item(id)?;
-            match &it.kind {
-                ItemKind::Subclip { parent, .. } => id = *parent,
-                _ => return if size_is_final(it) { self.source_size(id) } else { None },
-            }
-        }
-        None
+        let id = self.subclip_root(item)?;
+        if size_is_final(self.item(id)?) { self.source_size(id) } else { None }
     }
 }
 
@@ -1760,6 +1768,36 @@ mod tests {
         path["vertices"][0]["p"]["x"] = serde_json::Value::Null;
         assert!(serde_json::from_value::<MaskPath>(path.clone()).is_err());
         assert!(serde_json::from_value::<ParamValue>(serde_json::json!({ "Path": path })).is_err());
+    }
+
+    #[test]
+    fn subclip_cycles_are_bounded() {
+        let (mut p, clip, _) = demo_project();
+        let r = TimeRange::new(Tick::ZERO, Tick(TICKS_PER_SECOND));
+        let sub = p.add_item("Sub", Label::Iris, ItemKind::Subclip { parent: clip, range: r, restrict_trims: false }, None);
+        assert_eq!(p.subclip_root(sub), Some(clip));
+        assert_eq!(p.subclip_root(clip), Some(clip));
+        assert_eq!(p.subclip_media(sub).map(|(i, _)| i), Some(clip));
+        // a damaged project: a subclip pointing at itself, and a two-item loop
+        let me = p.add_item("Self", Label::Iris, ItemKind::Subclip { parent: ItemId(0), range: r, restrict_trims: false }, None);
+        let a = p.add_item("A", Label::Iris, ItemKind::Subclip { parent: ItemId(0), range: r, restrict_trims: false }, None);
+        let b = p.add_item("B", Label::Iris, ItemKind::Subclip { parent: a, range: r, restrict_trims: false }, None);
+        for (id, parent) in [(me, me), (a, b)] {
+            if let Some(ItemKind::Subclip { parent: q, .. }) = p.item_mut(id).map(|i| &mut i.kind) {
+                *q = parent;
+            }
+        }
+        for id in [me, a, b] {
+            assert_eq!(p.subclip_root(id), None);
+            assert!(p.subclip_media(id).is_none());
+            assert_eq!(p.source_size(id), None);
+        }
+        // a chain longer than the hop limit is refused too
+        let mut last = clip;
+        for _ in 0..=MAX_SUBCLIP_HOPS {
+            last = p.add_item("Deep", Label::Iris, ItemKind::Subclip { parent: last, range: r, restrict_trims: false }, None);
+        }
+        assert_eq!(p.subclip_root(last), None);
     }
 
     #[test]

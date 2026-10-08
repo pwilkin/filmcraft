@@ -190,3 +190,112 @@ fn bento_values_round_trip() {
     assert_eq!(c.name_of(c.id_of("Test:Big").unwrap()), Some("Test:Big"));
     assert!(Container::open(&bytes[..bytes.len() - 1]).is_err());
 }
+
+fn ref_array(targets: &[u32]) -> Vec<u8> {
+    let mut v = (targets.len() as u16).to_be_bytes().to_vec();
+    for t in targets {
+        v.extend_from_slice(&t.to_be_bytes());
+    }
+    v
+}
+
+fn object(w: &mut bento::Writer, class: &[u8; 4]) -> u32 {
+    let o = w.new_object();
+    w.set(o, "OMFI:OOBJ:ObjClass", "omfi:ClassID", class);
+    o
+}
+
+/// A hand-built OMF file: a composition whose one sound slot holds the segment `build` returns
+/// (given the writer and the sound data kind object), plus the extra mobs it returns.
+fn crafted(build: impl FnOnce(&mut bento::Writer, u32) -> (u32, Vec<u32>)) -> Vec<u8> {
+    let mut w = bento::Writer::new();
+    let head = object(&mut w, b"HEAD");
+    let sound = object(&mut w, b"DDEF");
+    w.set(sound, "OMFI:DDEF:DataKindID", "omfi:UniqueName", b"omfi:data:Sound\0");
+    let (seg, mut mobs) = build(&mut w, sound);
+    let slot = object(&mut w, b"MSLT");
+    w.set(slot, "OMFI:MSLT:Segment", "omfi:ObjRef", &seg.to_be_bytes());
+    w.set(slot, "OMFI:MSLT:EditRate", "omfi:Rational", &[0, 0, 0xBB, 0x80, 0, 0, 0, 1]);
+    let cmob = object(&mut w, b"CMOB");
+    w.set(cmob, "OMFI:MOBJ:MobID", "omfi:UID", &[1; 12]);
+    w.set(cmob, "OMFI:MOBJ:Slots", "omfi:ObjRefArray", &ref_array(&[slot]));
+    mobs.push(cmob);
+    w.set(head, "OMFI:HEAD:Mobs", "omfi:ObjRefArray", &ref_array(&mobs));
+    w.set(head, "OMFI:HEAD:PrimaryMobs", "omfi:ObjRefArray", &ref_array(&[cmob]));
+    w.finish()
+}
+
+/// Make `me` a sound sequence of `components`.
+fn sequence_object(w: &mut bento::Writer, sound: u32, me: u32, components: &[u32]) {
+    w.set(me, "OMFI:OOBJ:ObjClass", "omfi:ClassID", b"SEQU");
+    w.set(me, "OMFI:CPNT:DataKind", "omfi:ObjRef", &sound.to_be_bytes());
+    w.set(me, "OMFI:CPNT:Length", "omfi:Length32", &4800i32.to_be_bytes());
+    w.set(me, "OMFI:SEQU:Components", "omfi:ObjRefArray", &ref_array(components));
+}
+
+fn total_items(doc: &crate::comp::Document) -> usize {
+    doc.compositions.iter().flat_map(|c| &c.tracks).map(|t| t.items.len()).sum()
+}
+
+/// Sequences that contain themselves, or share one component thousands of times at each level,
+/// asked for ~2^32 expansions (a hang): a sequence inside itself is a gap, and the total work is
+/// capped.
+#[test]
+fn self_and_shared_components_are_bounded() {
+    // A = [A; 65535]
+    let bytes = crafted(|w, sound| {
+        let a = w.new_object();
+        sequence_object(w, sound, a, &vec![a; 65_535]);
+        (a, vec![])
+    });
+    let mut report = Report::default();
+    let doc = read::read(&bytes, &mut report).unwrap();
+    assert_eq!(total_items(&doc), 65_535, "each self reference is one gap");
+    // A = [B; 65535], B = [C; 65535], C = [FILL]
+    let bytes = crafted(|w, sound| {
+        let (a, b, c) = (w.new_object(), w.new_object(), w.new_object());
+        let f = object(w, b"FILL");
+        w.set(f, "OMFI:CPNT:DataKind", "omfi:ObjRef", &sound.to_be_bytes());
+        w.set(f, "OMFI:CPNT:Length", "omfi:Length32", &1i32.to_be_bytes());
+        sequence_object(w, sound, c, &[f]);
+        sequence_object(w, sound, b, &vec![c; 65_535]);
+        sequence_object(w, sound, a, &vec![b; 65_535]);
+        (a, vec![])
+    });
+    let started = std::time::Instant::now();
+    let mut report = Report::default();
+    let doc = read::read(&bytes, &mut report).unwrap();
+    assert!(total_items(&doc) <= 1 << 20, "{}", total_items(&doc));
+    assert!(started.elapsed() < std::time::Duration::from_secs(120));
+    assert!(report.entries.iter().any(|e| e.message.contains("too many components")), "{report:?}");
+}
+
+/// A source clip whose master mob's segment is a sequence that contains itself: the search for
+/// the master mob's first clip recursed until the stack overflowed.
+#[test]
+fn a_master_mob_sequence_that_contains_itself_is_bounded() {
+    let run = || {
+        let bytes = crafted(|w, sound| {
+            let x = w.new_object();
+            sequence_object(w, sound, x, &[x, x]);
+            let trkd = object(w, b"TRKD");
+            w.set(trkd, "OMFI:TRKD:TrackID", "omfi:UInt32", &1u32.to_be_bytes());
+            let slot = object(w, b"MSLT");
+            w.set(slot, "OMFI:MSLT:Segment", "omfi:ObjRef", &x.to_be_bytes());
+            w.set(slot, "OMFI:MSLT:TrackDesc", "omfi:ObjRef", &trkd.to_be_bytes());
+            let mmob = object(w, b"MMOB");
+            w.set(mmob, "OMFI:MOBJ:MobID", "omfi:UID", &[2; 12]);
+            w.set(mmob, "OMFI:MOBJ:Slots", "omfi:ObjRefArray", &ref_array(&[slot]));
+            let clip = object(w, b"SCLP");
+            w.set(clip, "OMFI:CPNT:DataKind", "omfi:ObjRef", &sound.to_be_bytes());
+            w.set(clip, "OMFI:CPNT:Length", "omfi:Length32", &10i32.to_be_bytes());
+            w.set(clip, "OMFI:SCLP:SourceID", "omfi:UID", &[2; 12]);
+            w.set(clip, "OMFI:SCLP:SourceTrackID", "omfi:UInt32", &1u32.to_be_bytes());
+            (clip, vec![mmob])
+        });
+        let mut report = Report::default();
+        let doc = read::read(&bytes, &mut report).unwrap();
+        assert_eq!(total_items(&doc), 1, "the clip is a gap");
+    };
+    std::thread::Builder::new().stack_size(256 * 1024).spawn(run).unwrap().join().unwrap();
+}

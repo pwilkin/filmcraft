@@ -225,16 +225,33 @@ fn timing(root: roxmltree::Node) -> Result<Timing> {
     Ok(Timing { rate, base, sub_frame_rate: sub, tick_rate })
 }
 
+/// Latest time (either way) a TTML time expression or nesting of timed elements yields (about 78
+/// hours, as interchange imports allow); a damaged file can name any number.
+const MAX_TIME: i64 = 1 << 56;
+
+/// Deepest nesting of `<div>` / `<span>` elements that is read.
+const MAX_DEPTH: usize = 256;
+
+/// `t` ticks clamped to ±[`MAX_TIME`].
+fn clamp_time(t: i128) -> Tick {
+    Tick(t.clamp(-(MAX_TIME as i128), MAX_TIME as i128) as i64)
+}
+
+/// `a + b`, saturating and clamped to ±[`MAX_TIME`].
+fn add_time(a: Tick, b: Tick) -> Tick {
+    clamp_time(a.0 as i128 + b.0 as i128)
+}
+
 /// Seconds as an exact decimal string → ticks.
 fn decimal_ticks(int: &str, frac: &str, unit_ticks: i128) -> Option<i128> {
     let i: i128 = if int.is_empty() { 0 } else { int.parse().ok()? };
-    let mut t = i * unit_ticks;
+    let mut t = i.checked_mul(unit_ticks)?;
     if !frac.is_empty() {
         if frac.len() > 12 || !frac.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
         let f: i128 = frac.parse().ok()?;
-        t += f * unit_ticks / 10i128.pow(frac.len() as u32);
+        t = t.checked_add(f.checked_mul(unit_ticks)? / 10i128.pow(frac.len() as u32))?;
     }
     Some(t)
 }
@@ -263,9 +280,9 @@ fn parse_time(s: &str, tm: Timing) -> Option<Tick> {
             let sub: i128 = if fs.is_empty() { 0 } else { num(fs)? };
             // frames at the effective rate; sub-frames divide a frame
             let ft = tm.rate.tick_of(1).0 as i128;
-            t += frames * ft + sub * ft / tm.sub_frame_rate.max(1) as i128;
+            t = t.checked_add(frames.checked_mul(ft)?)?.checked_add(sub.checked_mul(ft)? / tm.sub_frame_rate.max(1) as i128)?;
         }
-        return Some(Tick(t as i64));
+        return Some(clamp_time(t));
     }
     let unit_start = s.find(|c: char| c.is_ascii_alphabetic())?;
     let (v, unit) = s.split_at(unit_start);
@@ -281,16 +298,18 @@ fn parse_time(s: &str, tm: Timing) -> Option<Tick> {
         "f" => {
             let n: i128 = vi.parse().ok()?;
             let fd = tm.rate.tick_of(1).0 as i128;
-            let whole = tm.rate.tick_of(n as i64).0 as i128;
-            whole + decimal_ticks("0", vf, fd)?
+            // FrameRate::tick_of in i128 (it truncates to i64); huge values clamp below
+            let r = tm.rate.sane();
+            let whole = n.saturating_mul(tps).saturating_mul(r.den as i128).div_euclid(r.num as i128);
+            whole.checked_add(decimal_ticks("0", vf, fd)?)?
         }
         "t" => {
             let n: i128 = vi.parse().ok()?;
-            n * tps / tm.tick_rate.max(1) as i128
+            n.checked_mul(tps)? / tm.tick_rate.max(1) as i128
         }
         _ => return None,
     };
-    Some(Tick(t as i64))
+    Some(clamp_time(t))
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -349,7 +368,11 @@ impl Out {
 }
 
 /// Collect a `<p>`'s (or `<span>`'s) text with `<i>`/`<b>`/`<u>` tags, collapsing whitespace.
-fn collect(n: roxmltree::Node, styles: &std::collections::HashMap<String, Fmt>, fmt: Fmt, out: &mut Out) {
+/// Elements nested deeper than [`MAX_DEPTH`] are skipped.
+fn collect(n: roxmltree::Node, styles: &std::collections::HashMap<String, Fmt>, fmt: Fmt, out: &mut Out, depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
     for c in n.children() {
         if c.is_text() {
             for ch in c.text().unwrap_or("").chars() {
@@ -379,12 +402,12 @@ fn collect(n: roxmltree::Node, styles: &std::collections::HashMap<String, Fmt>, 
                     for t in &tags {
                         out.s.push_str(&format!("<{t}>"));
                     }
-                    collect(c, styles, f, out);
+                    collect(c, styles, f, out, depth + 1);
                     for t in tags.iter().rev() {
                         out.s.push_str(&format!("</{t}>"));
                     }
                 }
-                _ => collect(c, styles, fmt, out),
+                _ => collect(c, styles, fmt, out, depth + 1),
             }
         }
     }
@@ -394,7 +417,68 @@ fn clean(s: &str) -> String {
     s.lines().map(str::trim).collect::<Vec<_>>().join("\n").trim().to_string()
 }
 
+/// Deepest element nesting a TTML document may have. roxmltree parses nested elements
+/// recursively (around 1 KiB of stack per level), so a document nested 100 000 deep overflowed
+/// the stack.
+const MAX_XML_DEPTH: usize = 512;
+
+/// Index of the first `pat` in `b` at or after `from`.
+fn find(b: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
+    b.get(from..)?.windows(pat.len()).position(|w| w == pat).map(|i| from + i)
+}
+
+/// Whether `text` nests elements at most [`MAX_XML_DEPTH`] deep (checked without recursion,
+/// before roxmltree parses it). Comments, CDATA and processing instructions are skipped exactly as
+/// XML defines them; a DTD (which TTML parsing refuses anyway) or malformed markup is `false`.
+fn nesting_ok(text: &str) -> bool {
+    let b = text.as_bytes();
+    let mut i = 0;
+    let mut depth = 0usize;
+    while let Some(off) = b.get(i..).and_then(|r| r.iter().position(|&c| c == b'<')) {
+        i += off;
+        let rest = b.get(i..).unwrap_or_default();
+        i = if rest.starts_with(b"<!--") {
+            find(b, i + 4, b"-->").map_or(b.len(), |e| e + 3)
+        } else if rest.starts_with(b"<![CDATA[") {
+            find(b, i + 9, b"]]>").map_or(b.len(), |e| e + 3)
+        } else if rest.starts_with(b"<?") {
+            find(b, i + 2, b"?>").map_or(b.len(), |e| e + 2)
+        } else if rest.starts_with(b"<!") {
+            return false;
+        } else {
+            // the tag, to its `>` outside quoted attribute values (which can't contain `<`)
+            let mut j = i + 1;
+            let mut quote = None;
+            loop {
+                let Some(&c) = b.get(j) else { return false };
+                match (quote, c) {
+                    (_, b'<') => return false,
+                    (Some(q), c) if c == q => quote = None,
+                    (Some(_), _) => {}
+                    (None, b'"' | b'\'') => quote = Some(c),
+                    (None, b'>') => break,
+                    (None, _) => {}
+                }
+                j += 1;
+            }
+            if rest.get(1) == Some(&b'/') {
+                depth = depth.saturating_sub(1);
+            } else if b.get(j.saturating_sub(1)) != Some(&b'/') {
+                depth += 1;
+                if depth > MAX_XML_DEPTH {
+                    return false;
+                }
+            }
+            j + 1
+        };
+    }
+    true
+}
+
 pub fn parse(text: &str) -> Result<Document> {
+    if !nesting_ok(text) {
+        return Err(Error::Syntax { line: 1, msg: format!("TTML elements are nested deeper than {MAX_XML_DEPTH} levels, or the markup is malformed") });
+    }
     let xml = roxmltree::Document::parse(text).map_err(|_| Error::NotFormat("TTML"))?;
     let root = xml.root_element();
     if root.tag_name().name() != "tt" {
@@ -413,7 +497,7 @@ pub fn parse(text: &str) -> Result<Document> {
     let Some(body) = root.children().find(|n| n.is_element() && n.tag_name().name() == "body") else {
         return Ok(doc);
     };
-    walk(body, Tick::ZERO, &tm, &styles, Fmt::default(), &mut doc);
+    walk(body, Tick::ZERO, &tm, &styles, Fmt::default(), &mut doc, 0);
     doc.cues.sort_by_key(|c| (c.start, c.end));
     Ok(doc)
 }
@@ -428,22 +512,25 @@ fn times(n: roxmltree::Node, parent: Tick, tm: &Timing, doc: &mut Document) -> (
         }
         t
     };
-    let begin = p("begin", doc).map(|b| parent + b);
+    let begin = p("begin", doc).map(|b| add_time(parent, b));
     let end = match (p("end", doc), p("dur", doc)) {
-        (Some(e), _) => Some(parent + e),
-        (None, Some(d)) => Some(begin.unwrap_or(parent) + d),
+        (Some(e), _) => Some(add_time(parent, e)),
+        (None, Some(d)) => Some(add_time(begin.unwrap_or(parent), d)),
         _ => None,
     };
     (begin, end)
 }
 
-fn walk(n: roxmltree::Node, parent: Tick, tm: &Timing, styles: &std::collections::HashMap<String, Fmt>, fmt: Fmt, doc: &mut Document) {
+fn walk(n: roxmltree::Node, parent: Tick, tm: &Timing, styles: &std::collections::HashMap<String, Fmt>, fmt: Fmt, doc: &mut Document, depth: usize) {
     for c in n.children().filter(|c| c.is_element()) {
         let f = style_of(c, styles, fmt);
         match c.tag_name().name() {
+            "div" if depth >= MAX_DEPTH => {
+                doc.warnings.push(format!("<div> elements nested deeper than {MAX_DEPTH} were skipped"));
+            }
             "div" => {
                 let (b, _) = times(c, parent, tm, doc);
-                walk(c, b.unwrap_or(parent), tm, styles, f, doc);
+                walk(c, b.unwrap_or(parent), tm, styles, f, doc, depth + 1);
             }
             "p" => {
                 let (b, e) = times(c, parent, tm, doc);
@@ -456,7 +543,7 @@ fn walk(n: roxmltree::Node, parent: Tick, tm: &Timing, styles: &std::collections
                         for t in &tags {
                             o.s.push_str(&format!("<{t}>"));
                         }
-                        collect(c, styles, f, &mut o);
+                        collect(c, styles, f, &mut o, 0);
                         for t in tags.iter().rev() {
                             o.s.push_str(&format!("</{t}>"));
                         }
@@ -472,7 +559,7 @@ fn walk(n: roxmltree::Node, parent: Tick, tm: &Timing, styles: &std::collections
                             let (sb, se) = times(sp, base, tm, doc);
                             if let (Some(sb), Some(se)) = (sb, se) {
                                 let mut o = Out { s: String::new(), pending: false };
-                                collect(sp, styles, style_of(sp, styles, f), &mut o);
+                                collect(sp, styles, style_of(sp, styles, f), &mut o, 0);
                                 let text = clean(&o.s);
                                 if se > sb && !text.is_empty() {
                                     doc.cues.push(Cue { start: sb, end: se, text, speaker: speaker.clone(), ..Default::default() });
@@ -598,5 +685,64 @@ mod tests {
         assert_eq!(back.cues[0].speaker.as_deref(), Some("Ann Lee"));
         let d = write(&doc, Flavor::Dfxp, Some(r), "en");
         assert!(d.contains(DFXP_PROFILE) && d.contains("begin=\"00:00:01.001\""), "{d}");
+    }
+
+    /// `<div>`s and `<span>`s nested 100 000 deep overflowed the stack (inside roxmltree and in
+    /// the recursive walks): such a document is an error, and what lies deeper than MAX_DEPTH in
+    /// a document roxmltree can read is skipped.
+    #[test]
+    fn deep_nesting_is_bounded() {
+        let run = || {
+            let n = 100_000;
+            let divs = format!(r#"<tt xmlns="http://www.w3.org/ns/ttml"><body>{}{}</body></tt>"#, "<div>".repeat(n), "</div>".repeat(n));
+            assert!(crate::parse(divs.as_bytes(), crate::Format::Ttml).is_err());
+            let spans = format!(
+                r#"<tt xmlns="http://www.w3.org/ns/ttml"><body><div><p begin="1s" end="2s">{}{}</p></div></body></tt>"#,
+                "<span a='/>'>".repeat(n),
+                "</span>".repeat(n)
+            );
+            assert!(crate::parse(spans.as_bytes(), crate::Format::Ttml).is_err());
+        };
+        std::thread::Builder::new().stack_size(256 * 1024).spawn(run).unwrap().join().unwrap();
+        let run = || {
+            let n = 400;
+            let divs = format!(
+                r#"<tt xmlns="http://www.w3.org/ns/ttml"><body>{}<p begin="1s" end="2s">deep</p>{}<p begin="3s" end="4s">top</p></body></tt>"#,
+                "<div>".repeat(n),
+                "</div>".repeat(n)
+            );
+            let doc = crate::parse(divs.as_bytes(), crate::Format::Ttml).unwrap();
+            assert_eq!(doc.cues.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["top"]);
+            assert!(!doc.warnings.is_empty());
+            let spans = format!(
+                r#"<tt xmlns="http://www.w3.org/ns/ttml"><body><div><p begin="1s" end="2s">a{}b{}</p></div></body></tt>"#,
+                "<span>".repeat(n),
+                "</span>".repeat(n)
+            );
+            let doc = crate::parse(spans.as_bytes(), crate::Format::Ttml).unwrap();
+            assert_eq!(doc.cues.len(), 1);
+            assert_eq!(doc.cues[0].text, "a");
+        };
+        std::thread::Builder::new().stack_size(2 * 1024 * 1024).spawn(run).unwrap().join().unwrap();
+    }
+
+    /// Huge times wrapped when truncated to i64 and overflowed when added to a parent's begin
+    /// (a panic with overflow checks); they clamp now.
+    #[test]
+    fn huge_times_clamp() {
+        let t = tm(FrameRate::FPS_25);
+        let max = Some(Tick(MAX_TIME));
+        assert_eq!(parse_time("999999999999999h", t), max);
+        assert_eq!(parse_time("999999999999999f", t), max);
+        assert_eq!(parse_time("999999999999999t", Timing { tick_rate: 1, ..t }), max);
+        assert_eq!(parse_time("999999:999999:99999999999999999999999999999999999", t), None);
+        assert_eq!(parse_time("999999:999999:9999999999999999999", t), max);
+        let xml = format!(
+            r#"<tt xmlns="http://www.w3.org/ns/ttml"><body>{}<p begin="999999999999999h" dur="999999999999999h">x</p>{}</body></tt>"#,
+            r#"<div begin="999999999999999h">"#.repeat(200),
+            "</div>".repeat(200)
+        );
+        let doc = crate::parse(xml.as_bytes(), crate::Format::Ttml).unwrap();
+        assert!(doc.cues.iter().all(|c| c.start.0 <= MAX_TIME && c.end.0 <= MAX_TIME));
     }
 }

@@ -199,3 +199,48 @@ fn mutation_never_panics_or_hangs() {
         }
     }
 }
+
+/// A compound file of `sectors` sectors (after the header) with sector shift `shift`, whose header
+/// names sector 0 as every FAT sector; sector 0 is zeros, so the FAT maps every sector to 0 and
+/// the directory chain (starting at 0) loops on itself.
+fn looping_file(shift: u16, sectors: usize) -> Vec<u8> {
+    let ss = 1usize << shift;
+    let mut b = vec![0u8; (ss * (sectors + 1)).max(1024)];
+    let n_fat = sectors.min(109) as u32;
+    b[..8].copy_from_slice(&SIGNATURE);
+    b[24..26].copy_from_slice(&0x3Eu16.to_le_bytes());
+    b[26..28].copy_from_slice(&(if shift == 12 { 4u16 } else { 3 }).to_le_bytes());
+    b[28..30].copy_from_slice(&0xFFFEu16.to_le_bytes());
+    b[30..32].copy_from_slice(&shift.to_le_bytes());
+    b[32..34].copy_from_slice(&6u16.to_le_bytes());
+    b[44..48].copy_from_slice(&n_fat.to_le_bytes());
+    b[48..52].copy_from_slice(&0u32.to_le_bytes());
+    b[56..60].copy_from_slice(&MINI_STREAM_CUTOFF.to_le_bytes());
+    b[60..64].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
+    b[68..72].copy_from_slice(&ENDOFCHAIN.to_le_bytes());
+    for i in 0..109u32 {
+        let v = if i < n_fat { 0 } else { FREESECT };
+        let at = 76 + i as usize * 4;
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
+/// Sector shift 16 (64 KiB sectors) was accepted, and a looping chain appended a whole sector per
+/// FAT entry before the loop was noticed (~1 GiB from a 128 KiB file). Only the spec's shifts (9
+/// and 12) are accepted, and a chain stops after as many steps as the file has sectors.
+#[test]
+fn looping_chains_do_not_amplify() {
+    for shift in [7u16, 8, 10, 11, 13, 16] {
+        let e = CompoundFile::open(&looping_file(shift, 1)).unwrap_err();
+        assert!(matches!(&e, Error::Invalid(m) if m.contains("sector shift")), "{shift}: {e:?}");
+    }
+    // 109 FAT sectors that are all sector 0: the FAT has 109 × 1024 entries, the file 109 sectors
+    // (before: ~450 MiB appended before the loop was noticed)
+    let started = std::time::Instant::now();
+    for shift in [9u16, 12] {
+        let e = CompoundFile::open(&looping_file(shift, 109)).unwrap_err();
+        assert!(matches!(&e, Error::Invalid(m) if m.contains("loops")), "{shift}: {e:?}");
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+}

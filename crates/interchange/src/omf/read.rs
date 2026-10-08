@@ -10,6 +10,10 @@ use crate::{Error, Report, Result};
 
 type Uid = [u8; 12];
 
+/// Most components one file may expand into (shared components are expanded once per use, so a
+/// damaged file could otherwise ask for billions).
+const MAX_NODES: usize = 1 << 20;
+
 struct R<'a, 'b> {
     c: &'b Container<'a>,
     report: &'b mut Report,
@@ -19,6 +23,10 @@ struct R<'a, 'b> {
     media: HashMap<Uid, Vec<u8>>,
     doc: Document,
     sources: HashMap<(Uid, u32, String), usize>,
+    /// components being expanded (a component that contains itself becomes a gap)
+    open: HashSet<u32>,
+    /// components left to expand ([`MAX_NODES`])
+    budget: usize,
 }
 
 pub(crate) fn read(bytes: &[u8], report: &mut Report) -> Result<Document> {
@@ -27,7 +35,17 @@ pub(crate) fn read(bytes: &[u8], report: &mut Report) -> Result<Document> {
     let class_of = |o: u32| c.get(o, "OMFI:OOBJ:ObjClass").and_then(|v| v.get(..4).map(|b| [b[0], b[1], b[2], b[3]]));
     let head = c.objects.keys().copied().find(|&o| class_of(o) == Some(*b"HEAD")).ok_or_else(|| perr("no OMF header object".into()))?;
     let be = c.get(head, "OMFI:HEAD:ByteOrder").is_none_or(|v| v.first() != Some(&0x49));
-    let mut r = R { c: &c, report, be, mobs: HashMap::new(), media: HashMap::new(), doc: Document::default(), sources: HashMap::new() };
+    let mut r = R {
+        c: &c,
+        report,
+        be,
+        mobs: HashMap::new(),
+        media: HashMap::new(),
+        doc: Document::default(),
+        sources: HashMap::new(),
+        open: HashSet::new(),
+        budget: MAX_NODES,
+    };
     let mob_list = r.refs(head, "OMFI:HEAD:Mobs");
     let mob_list = if mob_list.is_empty() {
         c.objects.keys().copied().filter(|&o| matches!(class_of(o).as_ref(), Some(b"CMOB" | b"MMOB" | b"SMOB"))).collect()
@@ -51,8 +69,9 @@ pub(crate) fn read(bytes: &[u8], report: &mut Report) -> Result<Document> {
     }
     let cmobs: Vec<u32> = mob_list.iter().copied().filter(|&m| class_of(m) == Some(*b"CMOB")).collect();
     let mut referenced = HashSet::new();
+    let mut seen = HashSet::new();
     for &m in &cmobs {
-        r.collect_refs(m, &mut referenced, 0);
+        r.collect_refs(m, &mut referenced, &mut seen, 0);
     }
     let primary: Vec<u32> = r.refs(head, "OMFI:HEAD:PrimaryMobs").into_iter().filter(|m| cmobs.contains(m)).collect();
     let top: Vec<u32> = if !primary.is_empty() {
@@ -122,8 +141,9 @@ impl R<'_, '_> {
         self.i32(o, "OMFI:CPNT:Length").unwrap_or(0).max(0)
     }
 
-    fn collect_refs(&self, o: u32, out: &mut HashSet<Uid>, depth: usize) {
-        if depth > 64 {
+    fn collect_refs(&self, o: u32, out: &mut HashSet<Uid>, seen: &mut HashSet<u32>, depth: usize) {
+        // each object once: shared (or self-) references would otherwise multiply the work
+        if depth > 64 || !seen.insert(o) {
             return;
         }
         if self.class(o) == *b"SCLP"
@@ -133,12 +153,12 @@ impl R<'_, '_> {
         }
         for p in ["OMFI:MOBJ:Slots", "OMFI:SEQU:Components", "OMFI:EFFE:EffectSlots"] {
             for c in self.refs(o, p) {
-                self.collect_refs(c, out, depth + 1);
+                self.collect_refs(c, out, seen, depth + 1);
             }
         }
         for p in ["OMFI:MSLT:Segment", "OMFI:ESLT:ArgValue"] {
             if let Some(c) = self.r#ref(o, p) {
-                self.collect_refs(c, out, depth + 1);
+                self.collect_refs(c, out, seen, depth + 1);
             }
         }
     }
@@ -209,6 +229,23 @@ impl R<'_, '_> {
         if depth > 32 {
             return vec![CItem::Filler(len)];
         }
+        if self.budget == 0 {
+            return vec![CItem::Filler(len)];
+        }
+        self.budget -= 1;
+        if self.budget == 0 {
+            self.report.warn("the OMF file has too many components; the rest were imported as gaps");
+        }
+        if !self.open.insert(seg) {
+            self.report.warn("an OMF component contains itself (imported as a gap)");
+            return vec![CItem::Filler(len)];
+        }
+        let items = self.segment_items(seg, rate, len, depth);
+        self.open.remove(&seg);
+        items
+    }
+
+    fn segment_items(&mut self, seg: u32, rate: (i64, i64), len: Tick, depth: usize) -> Vec<CItem> {
         match &self.class(seg) {
             b"SEQU" => {
                 let mut out = Vec::new();
@@ -296,12 +333,19 @@ impl R<'_, '_> {
             .find(|&s| self.r#ref(s, "OMFI:MSLT:TrackDesc").and_then(|t| self.u32(t, "OMFI:TRKD:TrackID")) == Some(track))
     }
 
+    /// The first source clip of a segment (depth first; each sequence is searched once, so
+    /// cyclic or shared components stay bounded).
     fn first_clip(&self, seg: u32) -> Option<u32> {
-        match &self.class(seg) {
-            b"SCLP" => Some(seg),
-            b"SEQU" => self.refs(seg, "OMFI:SEQU:Components").into_iter().find_map(|c| self.first_clip(c)),
-            _ => None,
+        let mut seen = HashSet::new();
+        let mut stack = vec![seg];
+        while let Some(s) = stack.pop() {
+            match &self.class(s) {
+                b"SCLP" => return Some(s),
+                b"SEQU" if seen.insert(s) => stack.extend(self.refs(s, "OMFI:SEQU:Components").into_iter().rev()),
+                _ => {}
+            }
         }
+        None
     }
 
     fn resolve(&mut self, id: Uid, track: u32, start: Tick, master: Option<String>, depth: usize) -> Option<(usize, Tick)> {

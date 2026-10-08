@@ -439,7 +439,11 @@ fn decode_cost_ms(project: &Project, id: ItemId, depth: u32) -> f64 {
             };
             base * px
         }
-        ItemKind::Subclip { parent, .. } => decode_cost_ms(project, *parent, depth + 1),
+        // bounded: a damaged project can loop subclips
+        ItemKind::Subclip { .. } => match project.subclip_root(id) {
+            Some(root) if root != id => decode_cost_ms(project, root, depth + 1),
+            _ => 0.0,
+        },
         ItemKind::AdjustmentLayer { .. } => 0.0,
         // vector layers are drawn on the CPU (cached while static)
         ItemKind::Graphic { .. } => 1.5,

@@ -82,9 +82,11 @@ impl Default for RenderOptions {
     }
 }
 
-/// Output size for a sequence at a scale.
+/// Output size for a sequence at a scale (each side 1 ..= [`image::MAX_IMAGE_SIDE`]: a damaged
+/// project or a huge scale must not size a frame beyond what the compositor allocates).
 pub fn output_size(seq: &Sequence, scale: f32) -> (usize, usize) {
-    (((seq.settings.width as f32 * scale).round() as usize).max(1), ((seq.settings.height as f32 * scale).round() as usize).max(1))
+    let side = |v: u32| ((v as f32 * scale).round() as usize).clamp(1, image::MAX_IMAGE_SIDE);
+    (side(seq.settings.width), side(seq.settings.height))
 }
 
 /// Render sequence `seq_id` at timeline time `t`.
