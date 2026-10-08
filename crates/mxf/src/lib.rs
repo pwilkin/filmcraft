@@ -27,7 +27,7 @@ mod meta;
 mod source;
 pub mod write;
 
-pub use essence::{Codec, PictureInfo, SoundFormat, SoundInfo, aes3_element_samples, decode_pcm};
+pub use essence::{Codec, MAX_SOUND_CHANNELS, PictureInfo, SoundFormat, SoundInfo, aes3_element_samples, decode_pcm};
 pub use file::{Chunk, EssenceTrack, MxfFile, OperationalPattern, Partition, PartitionKind, Sample, Timecode, TrackKind, Wrapping, open};
 pub use index::{IndexEntry, IndexSegment};
 pub use klv::{Rational, Ul};

@@ -536,7 +536,7 @@ impl<W: Write + Seek> MxfWriter<W> {
         if cfg.pattern == Pattern::OpAtom && n_essence != 1 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "OP-Atom files hold exactly one essence track"));
         }
-        if cfg.sound.iter().any(|s| s.sample_rate == 0 || s.channels == 0 || !(1..=32).contains(&s.bits)) {
+        if cfg.sound.iter().any(|s| s.sample_rate == 0 || s.channels == 0 || s.channels > crate::MAX_SOUND_CHANNELS || !(1..=32).contains(&s.bits)) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid PCM sound description"));
         }
         let clip = cfg.pattern == Pattern::OpAtom;

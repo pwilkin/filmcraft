@@ -28,6 +28,68 @@ enum Inner {
     Ac3(Box<filmcraft_ac3::Decoder>),
 }
 
+/// Most decoded samples (all channels) a [`PacketCache`] keeps; older packets are dropped beyond
+/// it (64 MiB of f32), whatever the packet count.
+pub const MAX_CACHED_AUDIO_SAMPLES: usize = 16 << 20;
+
+/// Samples (all channels) held by one decoded packet.
+fn packet_samples(p: &[Vec<f32>]) -> usize {
+    p.iter().fold(0usize, |a, c| a.saturating_add(c.len()))
+}
+
+/// Decoded audio packets by index, oldest dropped first once there are more than `max_packets` of
+/// them or they hold more than `max_samples` samples, so hostile packet sizes cannot grow it
+/// without bound.
+pub(crate) struct PacketCache {
+    packets: std::collections::HashMap<usize, Arc<Vec<Vec<f32>>>>,
+    order: std::collections::VecDeque<usize>,
+    samples: usize,
+    max_packets: usize,
+    max_samples: usize,
+}
+
+impl PacketCache {
+    pub(crate) fn new(max_packets: usize) -> Self {
+        Self::with_limits(max_packets, MAX_CACHED_AUDIO_SAMPLES)
+    }
+
+    pub(crate) fn with_limits(max_packets: usize, max_samples: usize) -> Self {
+        PacketCache { packets: Default::default(), order: Default::default(), samples: 0, max_packets, max_samples }
+    }
+
+    pub(crate) fn get(&self, i: usize) -> Option<Arc<Vec<Vec<f32>>>> {
+        self.packets.get(&i).cloned()
+    }
+
+    pub(crate) fn insert(&mut self, i: usize, p: Arc<Vec<Vec<f32>>>) {
+        if let Some(old) = self.packets.insert(i, p.clone()) {
+            self.samples = self.samples.saturating_sub(packet_samples(&old));
+            self.order.retain(|&k| k != i);
+        }
+        self.samples = self.samples.saturating_add(packet_samples(&p));
+        self.order.push_back(i);
+        // the packet just inserted always stays (the caller is about to use it)
+        while self.order.len() > 1 && (self.order.len() > self.max_packets || self.samples > self.max_samples) {
+            let Some(old) = self.order.pop_front() else { break };
+            if let Some(o) = self.packets.remove(&old) {
+                self.samples = self.samples.saturating_sub(packet_samples(&o));
+            }
+        }
+    }
+
+    /// Packets held.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Samples held (all packets, all channels).
+    #[cfg(test)]
+    pub(crate) fn samples(&self) -> usize {
+        self.samples
+    }
+}
+
 /// Opus always decodes at 48 kHz (RFC 7845 §5.1: the input rate in the header is informational).
 pub const OPUS_RATE: u32 = 48_000;
 
@@ -698,6 +760,33 @@ pub fn opener(name: &str, bytes: Arc<[u8]>) -> Option<std::result::Result<Shared
         return None;
     }
     Some(AudioFileSource::decode(name, bytes).map(|s| Arc::new(s) as SharedSource).map_err(Into::into))
+}
+
+#[cfg(test)]
+mod packet_cache_tests {
+    use super::*;
+
+    #[test]
+    fn packet_cache_is_bounded_by_count_and_samples() {
+        let p = |n: usize| Arc::new(vec![vec![0.0f32; n]; 2]);
+        let mut c = PacketCache::with_limits(4, 1000);
+        for i in 0..10 {
+            c.insert(i, p(10));
+        }
+        assert_eq!(c.len(), 4);
+        assert!(c.get(9).is_some() && c.get(5).is_none());
+        // big packets evict by size, but the newest always stays
+        c.insert(20, p(400));
+        c.insert(21, p(400));
+        assert!(c.samples() <= 1000, "{}", c.samples());
+        assert!(c.get(21).is_some() && c.get(20).is_none());
+        c.insert(22, p(10_000));
+        assert_eq!(c.len(), 1);
+        assert!(c.get(22).is_some());
+        // replacing a packet does not double count it
+        c.insert(22, p(1));
+        assert_eq!((c.len(), c.samples()), (1, 2));
+    }
 }
 
 #[cfg(test)]

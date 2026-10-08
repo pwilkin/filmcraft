@@ -291,11 +291,10 @@ pub fn parse_lacing(lacing: Lacing, data: &[u8]) -> Result<Vec<(usize, usize)>> 
                 for _ in 1..count - 1 {
                     let Some((d, l)) = read_svint(&data[pos..]) else { return invalid("bad EBML lace delta") };
                     pos += l;
-                    prev += d;
-                    if prev < 0 {
-                        return invalid("negative EBML lace size");
-                    }
-                    sizes.push(prev as usize);
+                    let Some(next) = prev.checked_add(d) else { return invalid("EBML lace size overflows") };
+                    prev = next;
+                    let Ok(size) = usize::try_from(prev) else { return invalid("negative or oversized EBML lace size") };
+                    sizes.push(size);
                 }
             }
         }
@@ -373,6 +372,23 @@ mod tests {
             write_id(&mut b, id);
             assert_eq!(read_id(&b).unwrap(), (id, b.len()));
         }
+    }
+
+    #[test]
+    fn ebml_lacing_extreme_deltas_are_rejected() {
+        // 256 frames: the largest first size, then 254 of the largest positive deltas; the running
+        // size reaches i64::MAX and must be rejected, not wrap or panic.
+        let mut d = vec![255u8];
+        d.extend_from_slice(&[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        for _ in 0..254 {
+            d.extend_from_slice(&[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        }
+        d.extend_from_slice(&[0; 16]);
+        assert!(parse_lacing(Lacing::Ebml, &d).is_err());
+        // large negative deltas are rejected too
+        let mut d = vec![2u8, 0x81, 0x80, 0x80];
+        d.extend_from_slice(&[0; 4]);
+        assert!(parse_lacing(Lacing::Ebml, &d).is_err());
     }
 
     #[test]

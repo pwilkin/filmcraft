@@ -35,6 +35,9 @@ pub fn sniff(head: &[u8]) -> bool {
     filmcraft_mxf::sniff(head)
 }
 
+/// Highest sound sampling rate decoded (Hz); 768 kHz is the top of the DXD/DSD-PCM range.
+const MAX_AUDIO_RATE: u32 = 768_000;
+
 pub struct MxfSource {
     info: MediaInfo,
     bytes: crate::Src,
@@ -330,7 +333,7 @@ impl MxfSource {
         if let Some(&a0) = atracks.first() {
             let si0 = file.tracks[a0].sound.clone().unwrap_or_default();
             let rate = si0.sample_rate;
-            let mut channels = 0;
+            let mut channels: u32 = 0;
             for &ai in &atracks {
                 let t = &file.tracks[ai];
                 let Some(si) = t.sound.as_ref() else { continue };
@@ -341,12 +344,26 @@ impl MxfSource {
                 let first = (t.first_edit_unit() as i128 * n as i128 / d.max(1) as i128) as u64;
                 let stored = t.stored_sample_frames().saturating_sub(first);
                 let presented = t.duration.map_or(stored, |du| ((du as i128 * n as i128 / d.max(1) as i128) as u64).min(stored));
+                // the combined layout is capped like a single track's (each is already ≤ the cap)
+                let Some(total) = channels.checked_add(si.channels.max(1)).filter(|&c| c <= filmcraft_mxf::MAX_SOUND_CHANNELS) else { break };
                 aframes = aframes.min(presented);
-                channels += si.channels.max(1);
+                channels = total;
                 combined.push((ai, first));
             }
             let sr = if rate.is_valid() { (rate.num as f64 / rate.den as f64).round() as u32 } else { 48_000 };
-            audio = Some(AudioStreamInfo { sample_rate: sr.max(1), channels, codec: file.tracks[a0].codec.name().into(), bits_per_sample: Some(si0.bits) });
+            if sr > MAX_AUDIO_RATE {
+                // a hostile rate would make audio() read and resample enormous source spans
+                log::warn!("{name}: sound sampled at {sr} Hz (more than {MAX_AUDIO_RATE}); audio not decoded");
+                combined.clear();
+                aframes = 0;
+                channels = 0;
+            }
+            audio = (channels > 0).then(|| AudioStreamInfo {
+                sample_rate: sr.max(1),
+                channels,
+                codec: file.tracks[a0].codec.name().into(),
+                bits_per_sample: Some(si0.bits),
+            });
         }
         if aframes == u64::MAX {
             aframes = 0;
@@ -533,5 +550,28 @@ mod tests {
         let f = start_frames(&df, FrameRate::FPS_23_976);
         let secs = f as f64 * 1001.0 / 24000.0;
         assert!((secs - 107_892.0 * 1001.0 / 30000.0).abs() < 0.05, "{secs}");
+    }
+
+    /// Sound tracks are combined only up to `MAX_SOUND_CHANNELS` in total; the channel sum used to
+    /// be unbounded (and per-track counts were taken from the file as-is).
+    #[test]
+    fn combined_sound_channels_are_capped() {
+        use filmcraft_mxf::{MAX_SOUND_CHANNELS, MxfWriter, PackageIds, Pattern, Rational, SoundDesc, WriterConfig};
+        let ch = 40u32;
+        let mut cfg = WriterConfig::new(Pattern::Op1a, Rational::new(25, 1), PackageIds::from_seed("caps", "Caps"));
+        cfg.sound = vec![SoundDesc { sample_rate: 48_000, channels: ch, bits: 16 }; 2];
+        let mut w = MxfWriter::new(std::io::Cursor::new(Vec::new()), cfg).unwrap();
+        let pcm = vec![0u8; 1920 * ch as usize * 2];
+        for _ in 0..2 {
+            w.push_sound(0, &pcm).unwrap();
+            w.push_sound(1, &pcm).unwrap();
+        }
+        let bytes: Arc<[u8]> = w.finish().unwrap().into_inner().into();
+        let s = MxfSource::open("caps.mxf", bytes).unwrap();
+        let a = s.info().audio.as_ref().unwrap();
+        assert!(a.channels <= MAX_SOUND_CHANNELS, "{}", a.channels);
+        assert_eq!(a.channels, ch);
+        let buf = s.audio(0, 960, 48_000).unwrap();
+        assert_eq!(buf.channels.len(), ch as usize);
     }
 }

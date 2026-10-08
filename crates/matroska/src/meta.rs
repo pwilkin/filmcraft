@@ -234,7 +234,23 @@ pub(crate) fn parse_cues(d: &[u8], out: &mut Vec<CuePoint>) {
     }
 }
 
-fn parse_chapter(d: &[u8]) -> Chapter {
+/// Deepest ChapterAtom / SimpleTag nesting followed; deeper children are ignored, so a crafted file
+/// cannot overflow the stack.
+pub(crate) const MAX_META_DEPTH: u32 = 64;
+/// Most ChapterAtoms plus SimpleTags parsed per file; the rest are ignored, so a large Chapters or
+/// Tags element of tiny empty entries cannot allocate millions of structs.
+pub(crate) const MAX_META_ENTRIES: usize = 65_536;
+
+/// Take one entry from the metadata budget; false once it is spent.
+fn take(budget: &mut usize) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    true
+}
+
+fn parse_chapter(d: &[u8], depth: u32, budget: &mut usize) -> Chapter {
     let mut c = Chapter { uid: 0, string_uid: None, start_ns: 0, end_ns: None, hidden: false, enabled: true, displays: Vec::new(), children: Vec::new() };
     for e in Children::new(d) {
         match e.id {
@@ -260,15 +276,19 @@ fn parse_chapter(d: &[u8]) -> Chapter {
                 }
                 c.displays.push(disp);
             }
-            CHAPTER_ATOM => c.children.push(parse_chapter(e.data)),
+            CHAPTER_ATOM if depth < MAX_META_DEPTH && take(budget) => c.children.push(parse_chapter(e.data, depth + 1, budget)),
             _ => {}
         }
     }
     c
 }
 
-pub(crate) fn parse_chapters(d: &[u8], out: &mut Vec<Edition>) {
+/// Parse a Chapters element; `budget` counts the entries still allowed (see [`MAX_META_ENTRIES`]).
+pub(crate) fn parse_chapters(d: &[u8], out: &mut Vec<Edition>, budget: &mut usize) {
     for ed in Children::new(d).filter(|e| e.id == EDITION_ENTRY) {
+        if !take(budget) {
+            break;
+        }
         let mut edition = Edition::default();
         for e in Children::new(ed.data) {
             match e.id {
@@ -276,7 +296,7 @@ pub(crate) fn parse_chapters(d: &[u8], out: &mut Vec<Edition>) {
                 EDITION_FLAG_HIDDEN => edition.hidden = uint(e.data) != 0,
                 EDITION_FLAG_DEFAULT => edition.default = uint(e.data) != 0,
                 EDITION_FLAG_ORDERED => edition.ordered = uint(e.data) != 0,
-                CHAPTER_ATOM => edition.chapters.push(parse_chapter(e.data)),
+                CHAPTER_ATOM if take(budget) => edition.chapters.push(parse_chapter(e.data, 1, budget)),
                 _ => {}
             }
         }
@@ -284,7 +304,7 @@ pub(crate) fn parse_chapters(d: &[u8], out: &mut Vec<Edition>) {
     }
 }
 
-fn parse_simple_tag(d: &[u8]) -> SimpleTag {
+fn parse_simple_tag(d: &[u8], depth: u32, budget: &mut usize) -> SimpleTag {
     let mut t = SimpleTag { name: String::new(), language: "und".into(), default: true, string: None, binary: None, children: Vec::new() };
     for e in Children::new(d) {
         match e.id {
@@ -293,15 +313,19 @@ fn parse_simple_tag(d: &[u8]) -> SimpleTag {
             TAG_DEFAULT => t.default = uint(e.data) != 0,
             TAG_STRING => t.string = Some(string(e.data)),
             TAG_BINARY => t.binary = Some(e.data.to_vec()),
-            SIMPLE_TAG => t.children.push(parse_simple_tag(e.data)),
+            SIMPLE_TAG if depth < MAX_META_DEPTH && take(budget) => t.children.push(parse_simple_tag(e.data, depth + 1, budget)),
             _ => {}
         }
     }
     t
 }
 
-pub(crate) fn parse_tags(d: &[u8], out: &mut Vec<Tag>) {
+/// Parse a Tags element; `budget` counts the entries still allowed (see [`MAX_META_ENTRIES`]).
+pub(crate) fn parse_tags(d: &[u8], out: &mut Vec<Tag>, budget: &mut usize) {
     for tg in Children::new(d).filter(|e| e.id == TAG) {
+        if !take(budget) {
+            break;
+        }
         let mut tag = Tag::default();
         for e in Children::new(tg.data) {
             match e.id {
@@ -318,7 +342,7 @@ pub(crate) fn parse_tags(d: &[u8], out: &mut Vec<Tag>) {
                         }
                     }
                 }
-                SIMPLE_TAG => tag.simple.push(parse_simple_tag(e.data)),
+                SIMPLE_TAG if take(budget) => tag.simple.push(parse_simple_tag(e.data, 1, budget)),
                 _ => {}
             }
         }
@@ -536,4 +560,90 @@ pub(crate) fn parse_tracks(d: &[u8], timestamp_scale: u64) -> Vec<Track> {
         out.push(t);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ebml::{write_id, write_size};
+
+    /// `depth` elements with id `id` nested inside each other (built without quadratic copying).
+    fn nested(id: u32, depth: usize) -> Vec<u8> {
+        let mut probe = Vec::new();
+        write_id(&mut probe, id);
+        let hl = probe.len() + 8;
+        let mut out = Vec::with_capacity(depth * hl);
+        for k in 0..depth {
+            write_id(&mut out, id);
+            write_size(&mut out, ((depth - 1 - k) * hl) as u64, 8);
+        }
+        out
+    }
+
+    fn wrap(id: u32, inner: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_id(&mut out, id);
+        write_size(&mut out, inner.len() as u64, 8);
+        out.extend_from_slice(inner);
+        out
+    }
+
+    /// Runs `f` on a thread with a small stack, so unbounded recursion would overflow it.
+    fn small_stack(f: impl FnOnce() + Send + 'static) {
+        let h = std::thread::Builder::new().stack_size(256 * 1024).spawn(f).unwrap();
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn deeply_nested_chapters_do_not_overflow_the_stack() {
+        let ed = wrap(EDITION_ENTRY, &nested(CHAPTER_ATOM, 100_000));
+        small_stack(move || {
+            let mut out = Vec::new();
+            let mut budget = MAX_META_ENTRIES;
+            parse_chapters(&ed, &mut out, &mut budget);
+            assert_eq!(out.len(), 1);
+            let mut d = 1;
+            let mut cur = &out[0].chapters[0];
+            while let Some(n) = cur.children.first() {
+                d += 1;
+                cur = n;
+            }
+            assert_eq!(d, MAX_META_DEPTH as usize);
+        });
+    }
+
+    #[test]
+    fn deeply_nested_simple_tags_do_not_overflow_the_stack() {
+        let tag = wrap(TAG, &nested(SIMPLE_TAG, 100_000));
+        small_stack(move || {
+            let mut out = Vec::new();
+            let mut budget = MAX_META_ENTRIES;
+            parse_tags(&tag, &mut out, &mut budget);
+            assert_eq!(out.len(), 1);
+            let mut d = 1;
+            let mut cur = &out[0].simple[0];
+            while let Some(n) = cur.children.first() {
+                d += 1;
+                cur = n;
+            }
+            assert_eq!(d, MAX_META_DEPTH as usize);
+        });
+    }
+
+    #[test]
+    fn chapter_count_is_bounded() {
+        // 200 000 empty ChapterAtoms (2 bytes each) in one edition.
+        let atoms: Vec<u8> = std::iter::repeat_n([CHAPTER_ATOM as u8, 0x80], 200_000).flatten().collect();
+        let ed = wrap(EDITION_ENTRY, &atoms);
+        let mut out = Vec::new();
+        let mut budget = MAX_META_ENTRIES;
+        parse_chapters(&ed, &mut out, &mut budget);
+        assert_eq!(budget, 0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].chapters.len(), MAX_META_ENTRIES - 1);
+        // a further Chapters element gets nothing more
+        let mut more = Vec::new();
+        parse_chapters(&ed, &mut more, &mut budget);
+        assert!(more.is_empty());
+    }
 }

@@ -10,6 +10,10 @@ pub const SWITCHABLE: u8 = 4;
 /// `NONE` reference frame.
 pub const NONE: i8 = -1;
 
+/// Largest frame width or height decoded (as for VP9, DNx and APV): bigger sizes are refused
+/// before any frame buffer is allocated.
+pub const MAX_FRAME_DIM: u32 = 16384;
+
 /// Color configuration (5.5.2).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ColorConfig {
@@ -126,6 +130,9 @@ impl SequenceHeader {
         s.frame_height_bits = r.f(4)? + 1;
         s.max_frame_width = r.f(s.frame_width_bits)? + 1;
         s.max_frame_height = r.f(s.frame_height_bits)? + 1;
+        if s.max_frame_width > MAX_FRAME_DIM || s.max_frame_height > MAX_FRAME_DIM {
+            return Err(Error::Unsupported("frame size larger than 16384"));
+        }
         s.frame_id_numbers_present = if s.reduced_still_picture_header { false } else { r.flag()? };
         if s.frame_id_numbers_present {
             s.delta_frame_id_length_minus_2 = r.f(4)?;
@@ -1357,5 +1364,37 @@ fn decode_subexp(r: &mut BitReader, num_syms: i32) -> Result<i32> {
         } else {
             return Ok(r.f(b2 as u32)? as i32 + mk);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pack a string of 0/1 into bytes (MSB first, zero padded).
+    fn bits(s: &str) -> Vec<u8> {
+        let b: Vec<u8> = s.bytes().filter(|c| *c == b'0' || *c == b'1').map(|c| c - b'0').collect();
+        b.chunks(8).map(|c| c.iter().enumerate().fold(0u8, |a, (i, &v)| a | (v << (7 - i)))).collect()
+    }
+
+    /// Reduced still-picture sequence header with 16-bit frame size fields set to `w` x `h`.
+    fn seq(w: u32, h: u32) -> Vec<u8> {
+        let mut s = String::from("000 1 1 00000 1111 1111");
+        s += &format!("{:016b}{:016b}", w - 1, h - 1);
+        s += "0000000000000000000000000000000000000000";
+        bits(&s)
+    }
+
+    #[test]
+    fn oversized_sequence_frame_size_is_refused() {
+        assert!(matches!(SequenceHeader::parse(&seq(65536, 64)), Err(Error::Unsupported(_))));
+        assert!(matches!(SequenceHeader::parse(&seq(64, 16385)), Err(Error::Unsupported(_))));
+        // the cap itself parses past the size fields
+        assert!(!matches!(SequenceHeader::parse(&seq(16384, 16384)), Err(Error::Unsupported("frame size larger than 16384"))));
+        // through the decoder: a sequence header OBU (type 1, with size field)
+        let payload = seq(65536, 65536);
+        let mut obu = vec![0x0A, payload.len() as u8];
+        obu.extend_from_slice(&payload);
+        assert!(crate::Decoder::new().decode(&obu).is_err());
     }
 }

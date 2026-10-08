@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::essence::{Codec, PictureInfo, SoundFormat, SoundInfo, decode_pcm, identify_picture, sniff_picture};
+use crate::essence::{Codec, MAX_SOUND_CHANNELS, PictureInfo, SoundFormat, SoundInfo, decode_pcm, identify_picture, sniff_picture};
 use crate::index::{IndexEntry, IndexSegment};
 use crate::klv::{KeyClass, Ul, ber_length, classify, find_header_partition};
 use crate::meta::{Metadata, Primer, SUB_DESCRIPTORS_ITEM, Set, set_type as st, tag};
@@ -526,7 +526,9 @@ fn picture_info(d: &Set) -> PictureInfo {
 fn sound_info(d: &Set) -> SoundInfo {
     SoundInfo {
         sample_rate: d.rational(tag::AUDIO_SAMPLING_RATE).filter(Rational::is_valid).or_else(|| d.rational(tag::SAMPLE_RATE)).unwrap_or_default(),
-        channels: d.u(tag::CHANNEL_COUNT).unwrap_or(1) as u32,
+        // clamped so nothing downstream sizes buffers by a hostile count; build_track refuses to
+        // decode a track whose real count is larger
+        channels: d.u(tag::CHANNEL_COUNT).unwrap_or(1).clamp(0, i64::from(MAX_SOUND_CHANNELS)) as u32,
         bits: d.u(tag::QUANTIZATION_BITS).unwrap_or(16) as u32,
         block_align: d.u(tag::BLOCK_ALIGN).unwrap_or(0) as u32,
         locked: d.u(tag::LOCKED).map(|v| v != 0),
@@ -840,6 +842,10 @@ fn build_track(
             } else {
                 SoundFormat::Other
             };
+            if let Some(n) = desc.and_then(|d| d.u(tag::CHANNEL_COUNT)).filter(|&n| !(0..=i64::from(MAX_SOUND_CHANNELS)).contains(&n)) {
+                warnings.push(format!("sound track {} declares {n} channels (more than {MAX_SOUND_CHANNELS}); not decoded", r.track_id));
+                t.sound_format = SoundFormat::Other;
+            }
             t.codec = match t.sound_format {
                 SoundFormat::Aes3Element => Codec::Aes3Element,
                 SoundFormat::Pcm => Codec::Pcm,

@@ -15,7 +15,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::bits::{BitReader, leb128};
 use crate::cdf::Cdfs;
 use crate::frame::FrameBuf;
-use crate::header::{FilmGrainParams, FrameHeader, HeaderState, LoopFilterDeltas, RefInfo, SegmentationFeatures, SequenceHeader, default_gm_params};
+use crate::header::{
+    FilmGrainParams, FrameHeader, HeaderState, LoopFilterDeltas, MAX_FRAME_DIM, RefInfo, SegmentationFeatures, SequenceHeader, default_gm_params,
+};
 use crate::par::Pool;
 use crate::spec_tables::*;
 use crate::state::{FrameShared, FrameState, TileState};
@@ -504,9 +506,10 @@ impl Decoder {
             return Ok(Some(o));
         }
         // Encoders exist that code frames slightly larger than the sequence maximum (e.g. a
-        // 270-line stream coded as 272 lines); like other decoders we accept them.
-        if fh.upscaled_width > 65536 || fh.frame_height > 65536 {
-            return Err(Error::Invalid("frame size"));
+        // 270-line stream coded as 272 lines); like other decoders we accept them, but never past
+        // the absolute cap, which bounds every frame buffer.
+        if fh.upscaled_width > MAX_FRAME_DIM || fh.frame_height > MAX_FRAME_DIM {
+            return Err(Error::Unsupported("frame size larger than 16384"));
         }
         if !fh.frame_is_intra {
             for i in 0..REFS_PER_FRAME {

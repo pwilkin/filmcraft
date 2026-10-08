@@ -195,9 +195,9 @@ impl SliceHeader {
         let mut num_ref_idx_active = [pps.num_ref_idx_l0_default_active, pps.num_ref_idx_l1_default_active];
         if !slice_type.is_intra() {
             if r.read_flag()? {
-                num_ref_idx_active[0] = r.read_ue()? + 1;
+                num_ref_idx_active[0] = crate::params::read_ue_plus(&mut r, 1)?;
                 if slice_type.is_b() {
-                    num_ref_idx_active[1] = r.read_ue()? + 1;
+                    num_ref_idx_active[1] = crate::params::read_ue_plus(&mut r, 1)?;
                 }
             }
             let max = if field_pic { 32 } else { 16 };
@@ -303,7 +303,7 @@ impl SliceHeader {
             ensure!(cabac_init_idc <= 2, "cabac_init_idc out of range");
         }
         let slice_qp_delta = r.read_se()?;
-        let qp = pps.pic_init_qp + slice_qp_delta;
+        let qp = pps.pic_init_qp.saturating_add(slice_qp_delta);
         ensure!((0..=51).contains(&qp), "slice QP {qp} out of range");
         let mut sp_for_switch = false;
         let mut slice_qs_delta = 0;

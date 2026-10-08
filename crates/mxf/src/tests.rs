@@ -387,3 +387,34 @@ fn a_corrupt_index_position_cannot_allocate_a_giant_sparse_table() {
     let file = open(&bytes).unwrap();
     assert_eq!(file.tracks[file.track_of_kind(TrackKind::Picture).unwrap()].samples.len(), 5);
 }
+
+/// Replace the single occurrence of `from` in `f` with `to` (same length).
+fn patch(f: &mut [u8], from: &[u8], to: &[u8]) {
+    let at = f.windows(from.len()).position(|w| w == from).unwrap();
+    assert_eq!(f.windows(from.len()).filter(|w| *w == from).count(), 1);
+    f[at..at + to.len()].copy_from_slice(to);
+}
+
+#[test]
+fn huge_channel_count_is_capped_and_not_decoded() {
+    let (to, flags) = ipbb();
+    let mut f = build(3, prores_like, &to, &flags);
+    // wave descriptor ChannelCount 2 → u32::MAX
+    patch(&mut f, &[0x3D, 0x07, 0, 4, 0, 0, 0, 2], &[0x3D, 0x07, 0, 4, 0xFF, 0xFF, 0xFF, 0xFF]);
+    let m = open(&f).unwrap();
+    let ti = m.track_of_kind(TrackKind::Sound).unwrap();
+    let t = &m.tracks[ti];
+    assert!(t.sound.as_ref().unwrap().channels <= MAX_SOUND_CHANNELS);
+    assert_eq!(t.sound_format, SoundFormat::Other);
+    assert!(m.warnings.iter().any(|w| w.contains("channels")), "{:?}", m.warnings);
+    // used to size one buffer per declared channel (4 billion of them)
+    let _ = m.read_pcm(&f, ti, 0, 1920);
+    let _ = m.read_pcm(&f, ti, u64::MAX - 5, 100);
+}
+
+#[test]
+fn writer_rejects_too_many_channels() {
+    let ids = PackageIds::from_seed("atom-c", "Atom C");
+    let opts = OpAtomPcm { sample_rate: 48_000, bits: 16, channels: MAX_SOUND_CHANNELS + 1, edit_rate: None, ids, timecode: None };
+    assert!(write_opatom_pcm(&opts, &[0; 130]).is_err());
+}

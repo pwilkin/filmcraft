@@ -10,7 +10,6 @@
 //!   decoder), Blu-ray / AVCHD and DVD LPCM. Audio frames are placed on the timeline from their
 //!   PTS relative to the first video frame, sample-contiguously (re-anchored only at gaps).
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use filmcraft_frame::{AudioBuffer, VideoFrame};
@@ -75,8 +74,7 @@ enum ACodec {
 
 struct AudioState {
     dec: Option<AudioDecoder>,
-    cache: HashMap<usize, Arc<Vec<Vec<f32>>>>,
-    order: VecDeque<usize>,
+    cache: crate::audio::PacketCache,
     last: Option<usize>,
 }
 
@@ -609,15 +607,15 @@ impl MpegSource {
             lens,
             latm,
             byte_starts,
-            state: Mutex::new(AudioState { dec: None, cache: HashMap::new(), order: VecDeque::new(), last: None }),
+            state: Mutex::new(AudioState { dec: None, cache: crate::audio::PacketCache::new(2048), last: None }),
         })
     }
 
     /// Decoded samples of audio unit `i` (cached; non-sequential access primes the decoder with
     /// the previous unit).
     fn audio_unit(&self, a: &AudioTrack, st: &mut AudioState, i: usize) -> crate::Result<Arc<Vec<Vec<f32>>>> {
-        if let Some(p) = st.cache.get(&i) {
-            return Ok(p.clone());
+        if let Some(p) = st.cache.get(i) {
+            return Ok(p);
         }
         let file = self.file.as_ref().ok_or_else(|| CodecError::Container("no stream file".into()))?;
         let read = |k: usize| file.read_unit(&self.bytes, a.stream, k).map_err(|e| CodecError::Container(e.to_string()));
@@ -651,19 +649,13 @@ impl MpegSource {
             }
             _ => read(i)?,
         };
-        let out = match dec.decode(&data) {
-            Ok(v) => v,
-            Err(_) => vec![vec![0.0; a.lens[i] as usize]; a.channels],
-        };
+        // A unit that fails to decode adds nothing: the caller's window is already silent there.
+        // (Sizing silence by the unit's length, derived from hostile timestamps / sizes, could
+        // allocate gigabytes.)
+        let out = dec.decode(&data).unwrap_or_default();
         st.last = Some(i);
         let p = Arc::new(out);
         st.cache.insert(i, p.clone());
-        st.order.push_back(i);
-        if st.order.len() > 2048
-            && let Some(old) = st.order.pop_front()
-        {
-            st.cache.remove(&old);
-        }
         Ok(p)
     }
 }

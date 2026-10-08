@@ -174,6 +174,11 @@ pub enum SoundFormat {
     Other,
 }
 
+/// Most channels one sound track may carry. Larger ChannelCount values are hostile or broken
+/// (they would size huge per-channel buffers), so the reader refuses to decode such a track and the
+/// writer refuses to write one.
+pub const MAX_SOUND_CHANNELS: u32 = 64;
+
 /// Sound descriptor properties (ST 377-1 generic sound descriptor, ST 382 wave / AES3).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SoundInfo {

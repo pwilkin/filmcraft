@@ -208,3 +208,45 @@ fn synthetic_file() {
     assert_eq!(d.next_packet().unwrap().unwrap().pts, 1120);
     assert!(d.file().indexed);
 }
+
+#[test]
+fn hostile_timestamps_saturate_instead_of_overflowing() {
+    let mut f = Vec::new();
+    let mut h = Vec::new();
+    el_str(&mut h, DOC_TYPE, "matroska");
+    el(&mut f, EBML, &h);
+    write_id(&mut f, SEGMENT);
+    write_unknown_size(&mut f, 8);
+    let mut info = Vec::new();
+    el_uint(&mut info, TIMESTAMP_SCALE, u64::MAX);
+    el(&mut f, INFO, &info);
+    let mut a = Vec::new();
+    el_uint(&mut a, TRACK_NUMBER, 1);
+    el_uint(&mut a, TRACK_TYPE, 2);
+    el_str(&mut a, CODEC_ID, "A_PCM/INT/LIT");
+    el_uint(&mut a, DEFAULT_DURATION, u64::MAX);
+    el_uint(&mut a, CODEC_DELAY, u64::MAX);
+    let mut tr = Vec::new();
+    el(&mut tr, TRACK_ENTRY, &a);
+    el(&mut f, TRACKS, &tr);
+    // largest positive cluster timestamp + largest relative offset, 3 fixed-size laces
+    write_id(&mut f, CLUSTER);
+    write_unknown_size(&mut f, 8);
+    el_uint(&mut f, TIMESTAMP, i64::MAX as u64);
+    el(&mut f, SIMPLE_BLOCK, &block(1, i16::MAX, 0x84, &[2, 1, 2, 3]));
+    let mut g = Vec::new();
+    el(&mut g, BLOCK, &block(1, i16::MAX, 0x04, &[2, 1, 2, 3]));
+    el_uint(&mut g, BLOCK_DURATION, u64::MAX);
+    el(&mut f, BLOCK_GROUP, &g);
+    // a timestamp that reads as i64::MIN, plus the largest negative offset
+    write_id(&mut f, CLUSTER);
+    write_unknown_size(&mut f, 8);
+    el_uint(&mut f, TIMESTAMP, 1u64 << 63);
+    el(&mut f, SIMPLE_BLOCK, &block(1, i16::MIN, 0x80, &[9]));
+    let file = open_with(&f[..], &OpenOptions { index: true, verify_crc: false }).unwrap();
+    assert_eq!(file.tracks[0].samples.len(), 7);
+    let _ = file.duration_ns();
+    let d = Demuxer::from_slice(&f).unwrap();
+    let p: Vec<Packet> = d.map(|p| p.unwrap()).collect();
+    assert_eq!(p.len(), 7);
+}

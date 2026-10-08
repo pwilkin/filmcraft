@@ -369,7 +369,7 @@ fn parse_block_elem<S: ByteSource + ?Sized>(
             Ok(Some(BlockRef {
                 track,
                 block_offset: h.pos,
-                ts: cluster_ts + rel as i64,
+                ts: cluster_ts.saturating_add(rel as i64),
                 frames,
                 block_duration: None,
                 keyframe: flags & 0x80 != 0,
@@ -398,7 +398,7 @@ fn parse_block_elem<S: ByteSource + ?Sized>(
             Ok(Some(BlockRef {
                 track,
                 block_offset: h.pos,
-                ts: cluster_ts + rel as i64,
+                ts: cluster_ts.saturating_add(rel as i64),
                 frames,
                 block_duration: dur,
                 keyframe: !has_ref,
@@ -411,6 +411,11 @@ fn parse_block_elem<S: ByteSource + ?Sized>(
     }
 }
 
+/// Clamp an i128 into the i64 range.
+fn sat_i64(v: i128) -> i64 {
+    i64::try_from(v).unwrap_or(if v < 0 { i64::MIN } else { i64::MAX })
+}
+
 /// Expand a block into frames with per-lace timestamps.
 fn expand(b: &BlockRef, t: &Track, scale: u64, skip: u16, out: &mut impl Extend<FrameRef>) {
     let n = b.frames.len() as u64;
@@ -420,30 +425,36 @@ fn expand(b: &BlockRef, t: &Track, scale: u64, skip: u16, out: &mut impl Extend<
         (None, Some(dd)) => Some(dd as u128 * n as u128),
         _ => None,
     };
-    let scale_i = scale as i128;
-    // round half away from zero
-    let to_ticks = |ns: i128| -> i64 { (if ns >= 0 { (ns + scale_i / 2) / scale_i } else { (ns - scale_i / 2) / scale_i }) as i64 };
+    // scale is never 0 (parse_info ignores a zero TimestampScale); max(1) keeps the division safe anyway
+    let scale_i = (scale as i128).max(1);
+    // round half away from zero; hostile timestamps saturate instead of wrapping
+    let to_ticks = |ns: i128| -> i64 {
+        let t = if ns >= 0 { ns.saturating_add(scale_i / 2) / scale_i } else { ns.saturating_sub(scale_i / 2) / scale_i };
+        sat_i64(t)
+    };
     // CodecDelay is subtracted from every timestamp (RFC 9559 §5.1.4.1.25); in ticks it is rounded
     // once, so tick timestamps stay on the block grid.
     let delay_ns = t.codec_delay_ns as i128;
     let delay_ticks = to_ticks(delay_ns);
-    let base_ns = b.ts as i128 * scale_i;
+    let base_ns = (b.ts as i128).saturating_mul(scale_i);
+    let n128 = (n as u128).max(1);
+    let lace_ns = |total: u128, k: u128| -> i128 { i128::try_from(total.saturating_mul(k) / n128).unwrap_or(i128::MAX) };
     out.extend(b.frames.iter().enumerate().skip(skip as usize).map(|(i, &(offset, size))| {
         let (start, end) = match block_ns {
-            Some(total) => ((total * i as u128 / n as u128) as i128, Some((total * (i as u128 + 1) / n as u128) as i128)),
+            Some(total) => (lace_ns(total, i as u128), Some(lace_ns(total, i as u128 + 1))),
             None => (0, None),
         };
-        let pts_ns = base_ns + start - delay_ns;
-        let pts = to_ticks(base_ns + start) - delay_ticks;
-        let duration = end.map_or(0, |e| (to_ticks(e) - to_ticks(start)).max(0) as u64);
+        let pts_ns = base_ns.saturating_add(start).saturating_sub(delay_ns);
+        let pts = to_ticks(base_ns.saturating_add(start)).saturating_sub(delay_ticks);
+        let duration = end.map_or(0, |e| to_ticks(e).saturating_sub(to_ticks(start)).max(0).unsigned_abs());
         FrameRef {
             track: b.track,
             offset,
             size,
             pts,
-            pts_ns: pts_ns as i64,
+            pts_ns: sat_i64(pts_ns),
             duration,
-            duration_ns: end.map_or(0, |e| (e - start).max(0) as u64),
+            duration_ns: end.map_or(0, |e| u64::try_from(e.saturating_sub(start).max(0)).unwrap_or(u64::MAX)),
             keyframe: b.keyframe,
             discardable: b.discardable,
             invisible: b.invisible,
@@ -582,7 +593,7 @@ fn open_impl<S: ByteSource + ?Sized>(src: &S, opts: &OpenOptions, cache: &mut Ca
     if seg.overruns(len) {
         file.warnings.push("Segment extends past end of file (truncated)".into());
     }
-    let mut w = Walker { opts, parsed: HashSet::new(), blocks_seen: false };
+    let mut w = Walker { opts, parsed: HashSet::new(), blocks_seen: false, meta_budget: crate::meta::MAX_META_ENTRIES };
     w.walk(&mut io, &mut file)?;
     finish_tracks(&mut file);
     Ok(file)
@@ -592,6 +603,8 @@ struct Walker<'o> {
     opts: &'o OpenOptions,
     parsed: HashSet<u64>,
     blocks_seen: bool,
+    /// ChapterAtoms / SimpleTags / Editions / Tags still allowed (shared by every Chapters and Tags element).
+    meta_budget: usize,
 }
 
 impl Walker<'_> {
@@ -719,8 +732,8 @@ impl Walker<'_> {
                 }
             }
             CUES => parse_cues(&data, &mut file.cues),
-            CHAPTERS => parse_chapters(&data, &mut file.chapters),
-            TAGS => parse_tags(&data, &mut file.tags),
+            CHAPTERS => parse_chapters(&data, &mut file.chapters, &mut self.meta_budget),
+            TAGS => parse_tags(&data, &mut file.tags, &mut self.meta_budget),
             _ => {}
         }
         Ok(end)
@@ -810,7 +823,7 @@ impl MkvFile {
         if let Some(d) = self.info.duration {
             return Some((d * self.info.timestamp_scale as f64).round() as u64);
         }
-        let end = self.tracks.iter().flat_map(|t| t.samples.iter().map(|s| s.pts + s.duration as i64)).max()?;
+        let end = self.tracks.iter().flat_map(|t| t.samples.iter().map(|s| s.pts.saturating_add(i64::try_from(s.duration).unwrap_or(i64::MAX)))).max()?;
         Some((end.max(0) as u64).saturating_mul(self.info.timestamp_scale))
     }
 

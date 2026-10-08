@@ -6,6 +6,10 @@ use filmcraft_bitstream::BitReader;
 /// `'icpf'`: the frame identifier following the 32-bit frame size.
 pub const FRAME_ID: [u8; 4] = *b"icpf";
 
+/// Largest frame width or height decoded (as for AV1, VP9, DNx and APV); bigger frames are refused
+/// before any picture buffer is allocated.
+pub const MAX_DIM: u16 = 16384;
+
 /// A parsed ProRes frame header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameHeader {
@@ -107,6 +111,9 @@ impl FrameHeader {
         }
         if width == 0 || height == 0 {
             return Err(Error::Invalid("zero frame dimension"));
+        }
+        if width > MAX_DIM || height > MAX_DIM {
+            return Err(Error::Unsupported("frame larger than 16384 pixels"));
         }
         let hdr = FrameHeader {
             header_size,
@@ -230,5 +237,41 @@ mod tests {
         assert_eq!(row_slice_widths(7, 3), vec![4, 2, 1]);
         assert_eq!(row_slice_widths(2, 3), vec![2]);
         assert_eq!(row_slice_widths(5, 0), vec![1; 5]);
+    }
+
+    fn frame(width: u16, height: u16) -> Vec<u8> {
+        let hdr = FrameHeader {
+            header_size: 20,
+            bitstream_version: 0,
+            encoder_id: *b"test",
+            width,
+            height,
+            chroma: ChromaFormat::Yuv422,
+            interlace: Interlace::Progressive,
+            aspect_ratio: 0,
+            frame_rate_code: 0,
+            color: ColorInfo { primaries: 1, transfer: 1, matrix: 1 },
+            alpha: AlphaType::None,
+            qmat_luma: [4; 64],
+            qmat_chroma: [4; 64],
+            luma_matrix_present: false,
+            chroma_matrix_present: false,
+        };
+        let fh = hdr.write();
+        let mut out = ((8 + fh.len() + 16) as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(&FRAME_ID);
+        out.extend_from_slice(&fh);
+        out.extend_from_slice(&[0; 16]);
+        out
+    }
+
+    #[test]
+    fn frame_dimensions_are_capped() {
+        assert!(FrameHeader::parse(&frame(1920, 1080)).is_ok());
+        assert!(FrameHeader::parse(&frame(MAX_DIM, MAX_DIM)).is_ok());
+        assert!(matches!(FrameHeader::parse(&frame(65535, 1080)), Err(Error::Unsupported(_))));
+        assert!(matches!(FrameHeader::parse(&frame(1920, 16385)), Err(Error::Unsupported(_))));
+        assert!(matches!(FrameHeader::parse(&frame(1920, 0)), Err(Error::Invalid(_))));
+        assert!(matches!(FrameHeader::parse(&frame(0, 1080)), Err(Error::Invalid(_))));
     }
 }

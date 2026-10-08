@@ -4,7 +4,6 @@
 //! (`media_time` = pre-skip), or applied from `dOps` when a file has no edit list; random access
 //! decodes [`crate::audio::OPUS_PRE_ROLL`] of preceding packets first (≥ the 80 ms `roll` distance).
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use filmcraft_color::{ColorInfo, Matrix, Primaries, Range, Transfer};
@@ -24,8 +23,7 @@ const MAX_AAC_PROBE_UNIT: usize = 8 * 6144 / 8;
 struct AudioState {
     decoder: Option<PacketDecoder>,
     /// Decoded packets by sample index.
-    packets: HashMap<usize, Arc<Vec<Vec<f32>>>>,
-    order: Vec<usize>,
+    packets: crate::audio::PacketCache,
     last_decoded: Option<usize>,
 }
 
@@ -274,7 +272,7 @@ impl Mp4Source {
             vtrack,
             atrack,
             video: GopCache::new(explicit_color).with_rotation(rotation),
-            audio: Mutex::new(AudioState { decoder: None, packets: HashMap::new(), order: Vec::new(), last_decoded: None }),
+            audio: Mutex::new(AudioState { decoder: None, packets: crate::audio::PacketCache::new(4096), last_decoded: None }),
             audio_starts,
             audio_offset,
             audio_preroll,
@@ -295,8 +293,8 @@ impl Mp4Source {
     }
 
     fn audio_packet(&self, st: &mut AudioState, i: usize) -> crate::Result<Arc<Vec<Vec<f32>>>> {
-        if let Some(p) = st.packets.get(&i) {
-            return Ok(p.clone());
+        if let Some(p) = st.packets.get(i) {
+            return Ok(p);
         }
         let ti = self.atrack.ok_or_else(|| CodecError::Unsupported("no audio track".into()))?;
         let track = &self.file.tracks[ti];
@@ -326,19 +324,13 @@ impl Mp4Source {
                 }
                 let r = st.decoder.as_mut().ok_or_else(|| CodecError::Decode("no audio decoder".into()))?.decode(&data, self.audio_starts[i].max(0) as u64);
                 st.last_decoded = Some(i);
-                match r {
-                    Ok(v) => v,
-                    Err(_) => vec![vec![0.0; track.samples[i].duration as usize]; self.info.audio.as_ref().map_or(2, |a| a.channels as usize)],
-                }
+                // A packet that fails to decode adds nothing: the caller's window is already silent
+                // there. (Sizing silence by the hostile `stts` duration could allocate gigabytes.)
+                r.unwrap_or_default()
             }
         };
         let p = Arc::new(decoded);
         st.packets.insert(i, p.clone());
-        st.order.push(i);
-        if st.order.len() > 4096 {
-            let old = st.order.remove(0);
-            st.packets.remove(&old);
-        }
         Ok(p)
     }
 }
@@ -614,6 +606,26 @@ mod tests {
             mux.write_sample(t, WriteSample { data: &data, duration: 1, composition_offset: 0, is_sync: true }).expect("sample");
         }
         mux.finish().expect("finish").into_inner().into()
+    }
+
+    /// An AAC packet that fails to decode used to be replaced by silence sized from its `stts`
+    /// duration (up to u32::MAX frames per channel: tens of GB for one bogus packet).
+    #[test]
+    fn undecodable_packet_with_huge_duration_stays_small() {
+        use filmcraft_isobmff::{AacConfig, CodecConfig};
+        let aac = AacConfig::from_asc(vec![0x11, 0x90]); // AAC-LC, 48 kHz, stereo
+        let entry = SampleEntry::audio(FourCc(*b"mp4a"), CodecConfig::Aac(aac), 2, 48_000.0, 16);
+        let mut mux = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).expect("writer");
+        let t = mux.add_track(TrackConfig::new(entry, 48_000)).expect("track");
+        let junk = [0xFFu8; 64];
+        mux.write_sample(t, WriteSample { data: &junk, duration: u32::MAX, composition_offset: 0, is_sync: true }).expect("sample");
+        mux.write_sample(t, WriteSample { data: &junk, duration: 1024, composition_offset: 0, is_sync: true }).expect("sample");
+        let bytes: Arc<[u8]> = mux.finish().expect("finish").into_inner().into();
+        let s = Mp4Source::open("junk.m4a", bytes).expect("open");
+        let buf = s.audio(0, 1024, 48_000).expect("audio");
+        assert!(buf.channels.iter().flatten().all(|v| *v == 0.0));
+        let st = s.audio.lock().unwrap();
+        assert!(st.packets.samples() < 1 << 20, "{}", st.packets.samples());
     }
 
     /// A clip lasts as long as its edit list presents it, not as long as its media (`mdhd`) runs.
