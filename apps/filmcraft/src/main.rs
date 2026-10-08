@@ -9,7 +9,8 @@
 //!
 //! `--control <port>` (or `FILMCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server;
 //! see `filmcraft_ui_egui::control` for the methods. A port that is not a number is an error from
-//! either source.
+//! either source. Connections authenticate with the token written to
+//! `<data dir>/control-<port>.token` (or `FILMCRAFT_CONTROL_TOKEN`); see `control_server`.
 //!
 //! Auto-save and the crash-recovery journal run in every session (data in `--data-dir`, else
 //! `FILMCRAFT_DATA_DIR`, else the per-user application data folder). If a previous session died
@@ -90,6 +91,18 @@ fn main() -> eframe::Result {
     // OS hardware video decoders (VideoToolbox on macOS) in front of our own; Settings ▸ Playback ▸
     // Hardware decoding switches them off. Unsupported streams and failures use our decoders.
     register_hardware_decoders();
+    // Bind the control port and write its access token before the window opens; the token file
+    // is removed when `_control_token` drops at the end of `main`.
+    let (mut control, _control_token) = match control_port {
+        Some(port) => match control_server::prepare(port, data_dir.clone().or_else(default_data_dir).as_deref()) {
+            Ok((p, file)) => (Some(p), file),
+            Err(e) => {
+                eprintln!("filmcraft: {e}");
+                (None, None)
+            }
+        },
+        None => (None, None),
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("FilmCraft")
@@ -196,8 +209,8 @@ fn main() -> eframe::Result {
                 app.hooks.shortcuts_changed = Some(update);
                 app.ui.show_menu_bar = false;
             }
-            if let Some(port) = control_port {
-                let rx = control_server::start(port, cc.egui_ctx.clone());
+            if let Some(prepared) = control.take() {
+                let rx = control_server::start(prepared, cc.egui_ctx.clone());
                 app = app.with_control(rx);
             }
             Ok(Box::new(app))

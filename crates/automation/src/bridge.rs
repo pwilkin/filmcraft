@@ -1,8 +1,13 @@
 //! Client for the desktop app's JSON-lines control protocol. One connection, reconnect on failure.
+//!
+//! Each connection first authenticates with the app's control token: `FILMCRAFT_CONTROL_TOKEN`,
+//! else the `control-<port>.token` file the app wrote to its data folder (`FILMCRAFT_DATA_DIR`,
+//! else the per-user one). The token is looked up on every (re)connect, so a restarted app works.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use filmcraft_engine::control_auth;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -17,6 +22,11 @@ type Conn = (BufReader<tokio::net::tcp::OwnedReadHalf>, tokio::net::tcp::OwnedWr
 
 pub struct BridgeClient {
     addr: String,
+    port: Option<u16>,
+    /// Explicit token ([`BridgeClient::with_token`]); else looked up per connection.
+    token: Option<String>,
+    /// The app's data folder holding `control-<port>.token` ([`BridgeClient::with_data_dir`]).
+    data_dir: Option<std::path::PathBuf>,
     conn: Mutex<Option<Conn>>,
     next_id: AtomicU64,
 }
@@ -29,7 +39,65 @@ impl BridgeClient {
         if !matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1") {
             return Err(AutomationError::BadRequest(format!("bridge address must be loopback, got `{addr}`")));
         }
-        Ok(Self { addr, conn: Mutex::new(None), next_id: AtomicU64::new(1) })
+        let port = addr.rsplit_once(':').and_then(|(_, p)| p.parse().ok());
+        Ok(Self { addr, port, token: None, data_dir: None, conn: Mutex::new(None), next_id: AtomicU64::new(1) })
+    }
+
+    /// Use `token` instead of `FILMCRAFT_CONTROL_TOKEN` / the app's token file.
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+
+    /// Read the token file from `dir` (the app's `--data-dir`) instead of the default data folder.
+    pub fn with_data_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.data_dir = Some(dir.into());
+        self
+    }
+
+    fn token(&self) -> Result<String, AutomationError> {
+        if let Some(t) = &self.token {
+            return Ok(t.clone());
+        }
+        let found = match (&self.data_dir, self.port) {
+            (Some(d), Some(port)) => control_auth::env_token().or_else(|| control_auth::read_token_file(&control_auth::token_path(d, port))),
+            (None, Some(port)) => control_auth::client_token(port),
+            (_, None) => control_auth::env_token(),
+        };
+        found.ok_or_else(|| {
+            AutomationError::Bridge(format!(
+                "no control token for {}: the app writes it to <data dir>/control-<port>.token when started with `filmcraft --control <port>` (use the same FILMCRAFT_DATA_DIR here, or set {} for both)",
+                self.addr,
+                control_auth::TOKEN_ENV
+            ))
+        })
+    }
+
+    /// Connect and authenticate.
+    async fn connect(&self) -> Result<Conn, AutomationError> {
+        let token = self.token()?;
+        let s = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&self.addr))
+            .await
+            .map_err(|_| AutomationError::Bridge(format!("timed out connecting to {}", self.addr)))?
+            .map_err(|e| AutomationError::Bridge(format!("cannot connect to {} ({e}); start the app with `filmcraft --control <port>`", self.addr)))?;
+        let (r, mut w) = s.into_split();
+        let mut r = BufReader::new(r);
+        let line = format!("{}\n", json!({"id": 0, "method": control_auth::AUTH_METHOD, "params": {"token": token}}));
+        w.write_all(line.as_bytes()).await.map_err(|e| AutomationError::Bridge(e.to_string()))?;
+        let mut buf = String::new();
+        tokio::time::timeout(Duration::from_secs(10), r.read_line(&mut buf))
+            .await
+            .map_err(|_| AutomationError::Bridge("timeout authenticating".into()))?
+            .map_err(|e| AutomationError::Bridge(e.to_string()))?;
+        let v: Value = serde_json::from_str(&buf).map_err(|e| AutomationError::Bridge(format!("bad reply: {e}")))?;
+        if v.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(AutomationError::Bridge(format!(
+                "{} refused the control token: {}",
+                self.addr,
+                v.get("error").and_then(Value::as_str).unwrap_or("error")
+            )));
+        }
+        Ok((r, w))
     }
 
     /// Run engine command `id` in the app. A blocking export (`file.exportMedia` with
@@ -71,12 +139,7 @@ impl BridgeClient {
         let mut guard = self.conn.lock().await;
         for attempt in 0..2 {
             if guard.is_none() {
-                let s = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&self.addr))
-                    .await
-                    .map_err(|_| AutomationError::Bridge(format!("timed out connecting to {}", self.addr)))?
-                    .map_err(|e| AutomationError::Bridge(format!("cannot connect to {} ({e}); start the app with `filmcraft --control <port>`", self.addr)))?;
-                let (r, w) = s.into_split();
-                *guard = Some((BufReader::new(r), w));
+                *guard = Some(self.connect().await?);
             }
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let Some(conn) = guard.as_mut() else {
@@ -115,6 +178,7 @@ impl BridgeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, Write};
     use std::sync::Arc;
     use tokio::net::TcpListener;
 
@@ -132,6 +196,11 @@ mod tests {
             let mut polls = 0;
             while let Ok(Some(line)) = lines.next_line().await {
                 let req: Value = serde_json::from_str(&line).unwrap();
+                if req["method"] == "auth" {
+                    let ok = format!("{}\n", json!({"id": req["id"], "ok": true, "result": {"authenticated": true}}));
+                    w.write_all(ok.as_bytes()).await.unwrap();
+                    continue;
+                }
                 log.lock().await.push(req.clone());
                 let reply = match req["params"]["command"].as_str() {
                     Some("file.exportMedia") => json!({"job": 7, "path": "/tmp/out.mov"}),
@@ -155,7 +224,7 @@ mod tests {
     #[tokio::test]
     async fn a_blocking_export_is_polled_as_a_job() {
         let (addr, seen) = fake_app(json!({"frames": 642})).await;
-        let b = BridgeClient::new(addr).unwrap();
+        let b = BridgeClient::new(addr).unwrap().with_token("t");
         let r = b.execute("file.exportMedia", json!({"path": "/tmp/out.mov", "wait": true})).await.unwrap();
         assert_eq!(r, json!({"job": 7, "path": "/tmp/out.mov", "result": {"frames": 642}}));
         let seen = seen.lock().await;
@@ -168,7 +237,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_blocking_export_is_an_error() {
         let (addr, _) = fake_app(json!({"error": "encode: disk full"})).await;
-        let b = BridgeClient::new(addr).unwrap();
+        let b = BridgeClient::new(addr).unwrap().with_token("t");
         let e = b.execute("file.exportMedia", json!({"path": "/tmp/out.mov", "wait": true})).await.unwrap_err();
         assert!(e.to_string().contains("export failed: encode: disk full"), "{e}");
     }
@@ -177,11 +246,48 @@ mod tests {
     #[tokio::test]
     async fn other_commands_are_forwarded() {
         let (addr, seen) = fake_app(Value::Null).await;
-        let b = BridgeClient::new(addr).unwrap();
+        let b = BridgeClient::new(addr).unwrap().with_token("t");
         b.execute("file.exportMedia", json!({"path": "/tmp/out.mov"})).await.unwrap();
         b.execute("sequence.inspect", json!({})).await.unwrap();
         let seen = seen.lock().await;
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[1]["params"]["command"], "sequence.inspect");
+    }
+
+    /// A one-connection fake app that requires `token`, then answers one request.
+    fn fake_auth_app(token: &'static str) -> String {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut w = s;
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v["method"] != "auth" || v["params"]["token"] != token {
+                writeln!(w, "{}", json!({"ok": false, "error": "authentication failed"})).unwrap();
+                return;
+            }
+            writeln!(w, "{}", json!({"id": v["id"], "ok": true, "result": {"authenticated": true}})).unwrap();
+            line.clear();
+            r.read_line(&mut line).unwrap();
+            let v: Value = serde_json::from_str(&line).unwrap();
+            writeln!(w, "{}", json!({"id": v["id"], "ok": true, "result": v["method"]})).unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn authenticates_before_calling() {
+        let c = BridgeClient::new(fake_auth_app("s3cret")).unwrap().with_token("s3cret");
+        assert_eq!(c.call("ui.inspect", json!({})).await.unwrap(), json!("ui.inspect"));
+    }
+
+    #[tokio::test]
+    async fn wrong_token_is_an_error() {
+        let c = BridgeClient::new(fake_auth_app("s3cret")).unwrap().with_token("nope");
+        let e = c.call("ui.inspect", json!({})).await.unwrap_err().to_string();
+        assert!(e.contains("refused the control token"), "{e}");
     }
 }

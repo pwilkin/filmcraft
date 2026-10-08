@@ -175,7 +175,12 @@ impl FilmcraftMcp {
         Self { backend: Arc::new(Backend::Headless(Arc::new(Mutex::new(session)))), tool_router: Self::tool_router() }
     }
     pub fn bridge(addr: &str) -> Result<Self, AutomationError> {
-        Ok(Self { backend: Arc::new(Backend::Bridge(Arc::new(BridgeClient::new(addr)?))), tool_router: Self::tool_router() })
+        Ok(Self::bridge_with(BridgeClient::new(addr)?))
+    }
+
+    /// Bridge mode with a configured client (token, data folder).
+    pub fn bridge_with(client: BridgeClient) -> Self {
+        Self { backend: Arc::new(Backend::Bridge(Arc::new(client))), tool_router: Self::tool_router() }
     }
 
     pub async fn serve_stdio(self) -> Result<(), AutomationError> {

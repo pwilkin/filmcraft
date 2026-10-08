@@ -282,8 +282,7 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
                     Some("middle") => egui::PointerButton::Middle,
                     _ => egui::PointerButton::Primary,
                 };
-                let count = p.get("count").and_then(Value::as_u64).unwrap_or(1);
-                for _ in 0..count {
+                for _ in 0..click_count(p) {
                     app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: true, modifiers: m });
                     app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: false, modifiers: m });
                 }
@@ -297,7 +296,7 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
                 (Err(e), _) | (_, Err(e)) if e.starts_with(RETRY) => return Outcome::Retry(e.trim_start_matches(RETRY).to_string()),
                 (Err(e), _) | (_, Err(e)) => return err(e),
             };
-            let steps = p.get("steps").and_then(Value::as_u64).unwrap_or(12).max(2);
+            let steps = drag_steps(p);
             let m = modifiers(p);
             app.synthetic.push(egui::Event::PointerMoved(a));
             app.synthetic.push(egui::Event::PointerButton { pos: a, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
@@ -375,8 +374,10 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
             Outcome::Screenshot { path: s("path").map(str::to_string), crop }
         }
         "ui.resize" => {
-            let w = p.get("width").and_then(Value::as_f64).unwrap_or(1600.0) as f32;
-            let h = p.get("height").and_then(Value::as_f64).unwrap_or(1000.0) as f32;
+            let (w, h) = match (window_extent(p, "width", 1600.0), window_extent(p, "height", 1000.0)) {
+                (Ok(w), Ok(h)) => (w, h),
+                (Err(e), _) | (_, Err(e)) => return err(e),
+            };
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
             ok(Value::Null)
         }
@@ -391,6 +392,34 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
         }
         m => err(format!("unknown method `{m}`")),
     }
+}
+
+/// Most clicks one `ui.click` sends (a triple click is the most any widget uses).
+pub const MAX_CLICK_COUNT: u64 = 10;
+/// Most pointer moves one `ui.drag` sends.
+pub const MAX_DRAG_STEPS: u64 = 1000;
+/// Window size range `ui.resize` accepts (points).
+pub const WINDOW_EXTENT: std::ops::RangeInclusive<f64> = 100.0..=16384.0;
+
+/// `ui.click` `count` (default 1), at most [`MAX_CLICK_COUNT`]: every click queues events on the
+/// UI thread, so a huge count from the control channel must not hang the app.
+fn click_count(p: &Value) -> u64 {
+    p.get("count").and_then(Value::as_u64).unwrap_or(1).min(MAX_CLICK_COUNT)
+}
+
+/// `ui.drag` `steps` (default 12), within 2..=[`MAX_DRAG_STEPS`].
+fn drag_steps(p: &Value) -> u64 {
+    p.get("steps").and_then(Value::as_u64).unwrap_or(12).clamp(2, MAX_DRAG_STEPS)
+}
+
+/// A `ui.resize` dimension: `default` when absent, an error when not a finite number, clamped
+/// to [`WINDOW_EXTENT`].
+fn window_extent(p: &Value, key: &str, default: f64) -> Result<f32, String> {
+    let v = match p.get(key) {
+        None | Some(Value::Null) => default,
+        Some(v) => v.as_f64().filter(|x| x.is_finite()).ok_or_else(|| format!("`{key}` must be a finite number"))?,
+    };
+    Ok(v.clamp(*WINDOW_EXTENT.start(), *WINDOW_EXTENT.end()) as f32)
 }
 
 /// Merge `patch` into `v` (objects recursively; other values replace).
@@ -537,5 +566,36 @@ mod base64_tests {
         for (i, o) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {
             assert_eq!(super::base64(i.as_bytes()), o);
         }
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn click_count_is_bounded() {
+        assert_eq!(click_count(&json!({})), 1);
+        assert_eq!(click_count(&json!({"count": 2})), 2);
+        assert_eq!(click_count(&json!({"count": 1_000_000_000_000u64})), MAX_CLICK_COUNT);
+        assert_eq!(click_count(&json!({"count": u64::MAX})), MAX_CLICK_COUNT);
+    }
+
+    #[test]
+    fn drag_steps_are_bounded() {
+        assert_eq!(drag_steps(&json!({})), 12);
+        assert_eq!(drag_steps(&json!({"steps": 0})), 2);
+        assert_eq!(drag_steps(&json!({"steps": 1_000_000_000_000u64})), MAX_DRAG_STEPS);
+    }
+
+    #[test]
+    fn window_extent_is_finite_and_bounded() {
+        assert_eq!(window_extent(&json!({}), "width", 1600.0), Ok(1600.0));
+        assert_eq!(window_extent(&json!({"width": 800}), "width", 1600.0), Ok(800.0));
+        assert_eq!(window_extent(&json!({"width": 1e30}), "width", 1600.0), Ok(16384.0));
+        assert_eq!(window_extent(&json!({"width": -5}), "width", 1600.0), Ok(100.0));
+        assert!(window_extent(&json!({"width": "wide"}), "width", 1600.0).is_err());
+        // serde_json has no NaN / infinity: a non-finite f64 becomes null, i.e. the default
+        assert_eq!(window_extent(&json!({"width": f64::NAN}), "width", 1600.0), Ok(1600.0));
     }
 }

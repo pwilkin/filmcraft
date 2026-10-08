@@ -52,9 +52,12 @@ OPTIONS
   --demo                        open the built-in demo project (headless)
   --save                        save the project back to --project when done
   --save-as <p.fcproj>          save the project to this path when done
-  --bridge <127.0.0.1:PORT>     send commands to the running app (`filmcraft --control PORT`)
-  --data-dir <dir>              FilmCraft data directory for user export presets (headless;
-                                default: the app's data directory)
+  --bridge <127.0.0.1:PORT>     send commands to the running app (`filmcraft --control PORT`),
+                                authenticating with FILMCRAFT_CONTROL_TOKEN or the app's
+                                <data dir>/control-PORT.token
+  --data-dir <dir>              FilmCraft data directory for user export presets (headless)
+                                and the control token (--bridge; default: the app's data
+                                directory)
   --keep-going                  `run`: report failing lines and continue
   --compact                     one-line JSON output
 
@@ -83,13 +86,22 @@ enum Backend {
     Bridge(BridgeClient),
 }
 
+/// The bridge client for `--bridge addr` (token from `--data-dir` when given).
+fn bridge_client(a: &Args, addr: &str) -> BridgeClient {
+    let c = BridgeClient::new(addr).unwrap_or_else(|e| usage(e));
+    match a.opt("--data-dir") {
+        Some(d) => c.with_data_dir(d),
+        None => c,
+    }
+}
+
 impl Backend {
     fn open(a: &Args) -> Self {
         if let Some(addr) = a.opt("--bridge") {
             if a.opt("--project").is_some() || a.flag("--demo") {
                 usage("--bridge drives the running app; open projects there (exec file.open path=…)");
             }
-            return Backend::Bridge(BridgeClient::new(addr).unwrap_or_else(|e| usage(e)));
+            return Backend::Bridge(bridge_client(a, addr));
         }
         let mut s = Session::default();
         // user export presets (and other per-user libraries) from the data directory
@@ -367,7 +379,7 @@ async fn main() {
         }
         "mcp" => {
             let server = match a.opt("--bridge") {
-                Some(addr) => filmcraft_automation::FilmcraftMcp::bridge(addr).unwrap_or_else(|e| fail(e)),
+                Some(addr) => filmcraft_automation::FilmcraftMcp::bridge_with(bridge_client(&a, addr)),
                 None => match Backend::open(&a) {
                     Backend::Local(s) => filmcraft_automation::FilmcraftMcp::headless(*s),
                     Backend::Bridge(_) => usage("mcp: use --bridge ADDR to drive a running app"),

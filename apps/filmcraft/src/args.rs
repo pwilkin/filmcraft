@@ -6,7 +6,9 @@ Usage: filmcraft [options] [project.fcproj | media files...]
 
 Options:
   --control <port>   start the localhost JSON-lines control server
-                     (also: FILMCRAFT_CONTROL_PORT)
+                     (also: FILMCRAFT_CONTROL_PORT); clients authenticate
+                     with the token in <data dir>/control-<port>.token
+                     (or set FILMCRAFT_CONTROL_TOKEN for app and client)
   --demo             open the demo project
   --empty            start with an empty project
   --recover          recover the newest unsaved changes without asking

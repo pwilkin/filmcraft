@@ -1674,6 +1674,7 @@ dependencies = [
  "filmcraft-engine",
  "filmcraft-platform",
  "filmcraft-ui-egui",
+ "getrandom 0.3.4",
  "log",
  "muda",
  "objc2 0.6.4",

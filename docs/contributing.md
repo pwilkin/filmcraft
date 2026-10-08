@@ -36,7 +36,8 @@ cargo run --release -p filmcraft-cli -- mcp --demo    # headless MCP server on s
 cargo xtask web --serve 8765                          # the web app on http://127.0.0.1:8765/ (docs/web.md)
 ```
 
-`FILMCRAFT_CONTROL_PORT=9876` works like `--control 9876`, and `FILMCRAFT_CPU_COMPOSITE=1`
+`FILMCRAFT_CONTROL_PORT=9876` works like `--control 9876` (clients authenticate with the token in
+`<data dir>/control-9876.token`, or set `FILMCRAFT_CONTROL_TOKEN`; see `docs/control-protocol.md`), and `FILMCRAFT_CPU_COMPOSITE=1`
 disables the GPU compositor.
 `filmcraft --help` lists the app's options. An option it does not know, or a control port that is
 not a number (from `--control` or from `FILMCRAFT_CONTROL_PORT`), is an error on stderr with exit

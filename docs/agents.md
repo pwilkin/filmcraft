@@ -109,10 +109,13 @@ progress and stop it:
 ## 2. Control channel
 
 `filmcraft --control 9876` (or `FILMCRAFT_CONTROL_PORT=9876`) listens on `127.0.0.1` only. Send one
-JSON request per line and get one JSON reply per line. Full method table:
-[control-protocol.md](control-protocol.md).
+JSON request per line and get one JSON reply per line. Each connection first authenticates with the
+token the app writes to `<data dir>/control-9876.token` (owner-only), or the one you set in
+`FILMCRAFT_CONTROL_TOKEN` for both the app and the client. `filmcraft-cli --bridge` does this by
+itself. Full method table and details: [control-protocol.md](control-protocol.md).
 
 ```jsonc
+{"id":0,"method":"auth","params":{"token":"<contents of control-9876.token>"}}
 {"id":1,"method":"engine.commands"}
 {"id":2,"method":"engine.execute","params":{"command":"file.openDemoProject"}}
 {"id":3,"method":"engine.execute","params":{"command":"playhead.set","params":{"seconds":2}}}
@@ -128,11 +131,14 @@ Replies look like `{"id":4,"ok":true,"result":{"cuts":2}}` or `{"id":7,"ok":fals
 Minimal client:
 
 ```python
-import json, socket
+import json, os, pathlib, socket
+data = pathlib.Path(os.environ.get("FILMCRAFT_DATA_DIR") or pathlib.Path.home() / ".local/share/filmcraft")  # macOS: ~/Library/Application Support/FilmCraft
+token = os.environ.get("FILMCRAFT_CONTROL_TOKEN") or (data / "control-9876.token").read_text().strip()
 s = socket.create_connection(("127.0.0.1", 9876)); f = s.makefile("rw")
 def call(method, **params):
     f.write(json.dumps({"id": 1, "method": method, "params": params}) + "\n"); f.flush()
     return json.loads(f.readline())
+assert call("auth", token=token)["ok"]
 print(call("engine.execute", command="sequence.inspect"))
 ```
 

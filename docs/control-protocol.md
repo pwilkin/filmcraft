@@ -13,8 +13,27 @@ nothing sent after it on that connection runs. That covers text that isn't JSON,
 an object without `method`, invalid UTF-8, and a line longer than 4 MiB. An HTTP request (for example a
 web page's cross-origin `fetch` to `127.0.0.1:<port>`) therefore can't smuggle a command in its body:
 its request line is rejected first. At most 16 connections are served at once; further ones get an error
-line and are closed. Clients that get an error reply should reconnect. The port has no authentication,
-so only enable it while you use it. Transport: `apps/filmcraft/src/control_server.rs`.
+line and are closed. Clients that get an error reply should reconnect. Transport:
+`apps/filmcraft/src/control_server.rs`.
+
+**Authentication.** Every connection must authenticate before anything else: its first request is
+
+```json
+{"id": 0, "method": "auth", "params": {"token": "<token>"}}
+{"id": 0, "ok": true, "result": {"authenticated": true}}
+```
+
+When the server starts it writes a fresh random 256-bit token (64 hex digits) to
+`<data dir>/control-<port>.token` (the data dir is `--data-dir`, else `FILMCRAFT_DATA_DIR`, else
+`~/.local/share/filmcraft`, `~/Library/Application Support/FilmCraft` or `%APPDATA%\FilmCraft`). On
+Unix the file is created owner-only (mode 0600); it is replaced at every start and removed when the
+app quits. Set `FILMCRAFT_CONTROL_TOKEN` to choose the token yourself (1–1024 printable ASCII
+characters, no spaces), e.g. for a test harness: the app then uses it and writes no file. A first
+request that is not `auth`, or a wrong token, gets an error reply and the connection is closed. If
+the token file can't be written (and no `FILMCRAFT_CONTROL_TOKEN` is set) the control server does not
+start. `filmcraft-cli --bridge` and `filmcraft-cli mcp --bridge` find the token on their own
+(`FILMCRAFT_CONTROL_TOKEN`, else the token file in `--data-dir` or the default data dir, so give
+them the same data dir as the app).
 
 ```json
 {"id": 1, "method": "engine.execute", "params": {"command": "sequence.addEdit", "params": {"seconds": 3}}}
@@ -31,14 +50,14 @@ Methods (handlers in `crates/ui-egui/src/control.rs`):
 | `ui.elements` | `{prefix?}` | every on-screen interactive element: id, label, rect |
 | `ui.set` | `{tool, workspace, mode, theme, focused, playbackRes, timeline:{pps,scroll,fit}, program:{…}, source:{…}, clipDialog:{param: value}, menuDialog:{param: value}, panels:{scopes, timecode, reference, events, progress}, export:{…}}` | `program` / `source` merge fields into the monitor view state (`res`, `paused_res`, `high_quality`, `display`, `zoom`, `pan`, `show_rulers`, `show_guides`, `lock_guides`, `snap`, `guides`, `compare_ref`, …; see [monitors.md](monitors.md)); `clipDialog` sets fields of the open Edit / Clip / File dialog (Paste Attributes, Make Subclip, Frame Hold Options, …); `menuDialog` those of the M3.11 dialogs (Find, Create Search Bin, Project Settings, Scene Edit Detection, Simplify Sequence, Automate to Sequence…; see `panels::menu_dialogs`); `panels` merges into the panel settings (`ui.inspect` → `ui.panels`; see `panels::panel_state`): Lumetri Scopes `{shown: ["vectorscopeYuv"|"vectorscopeHls"|"histogram"|"parade"|"waveform"], waveformType, paradeType, colorSpace, brightness, scale, clamp, targets}`, Timecode `{rows: [{source, mode, display}], showName}`, Reference Monitor `{ganged, time, display: "composite"|"scopes", scopes}`, Events `{level, selected}`, Progress `{showFinished}` `export` deep-merges into Export mode state (`preset` — applied first —, `settings` (ExportSettings JSON), `fileName`, `location`, `range`, `customStart`, `customEnd`, `openSections`, `manager` (Preset Manager: `query`, `favoritesOnly`, `selected`, `saveName`), `quickOpen`, `quickPath`, `quickPreset`); `program` / `source` merge fields into the monitor view state (`res`, `paused_res`, `high_quality`, `display`, `zoom`, `pan`, `show_rulers`, `show_guides`, `lock_guides`, `snap`, `guides`, `compare_ref`, …; see [monitors.md](monitors.md)); `clipDialog` sets fields of the open Edit / Clip / File dialog (Paste Attributes, Make Subclip, Frame Hold Options, …); `menuDialog` those of the M3.11 dialogs (Find, Create Search Bin, Project Settings, Scene Edit Detection, Simplify Sequence, Automate to Sequence…; see `panels::menu_dialogs`); `projectPanel` merges into the Project panel's view state (`bin` shown in place, `tabs` (bins in a tab or window: `{bin, floating, view, iconSize, nav}`), `activeTab`, `selectedBin`, `rename: {item|bin, text}`, `dialog` (`{"metadataDisplay": {columns, filter}}`, `{"savePresetAs": {name}}`, `{"managePresets": {selected, name}}`, `{"freeformOptions": {options}}`, `{"saveArrangement": {name, bin}}`)); `mediaBrowser` into the Media Browser's (`expanded`, `pathEdit`, `editColumns`, `treeWidth`). View settings, columns and presets are engine commands (`project.view.set`, `project.columns.set`, `project.viewPreset.*`, `mediaBrowser.settings`) |
 | `ui.panel.show` / `ui.panel.close` | `{panel}` | |
-| `ui.click` / `ui.move` | `{id}` or `{x,y}`, `button`, `count`, `modifiers` | synthetic pointer input |
-| `ui.drag` | `{from, to, steps, modifiers}` | press–move–release |
+| `ui.click` / `ui.move` | `{id}` or `{x,y}`, `button`, `count`, `modifiers` | synthetic pointer input; `count` is capped at 10 |
+| `ui.drag` | `{from, to, steps, modifiers}` | press–move–release; `steps` is clamped to 2–1000 |
 | `ui.scroll` | `{id|x,y, dx, dy, modifiers}` | wheel / trackpad |
 | `ui.key` / `ui.type` | `{key}` (`Cmd+K`, `Space`…) / `{text}` | keyboard |
 | `ui.timeline.hit` / `ui.timeline.locate` | `{x,y}` / `{clip, edge?}` | timeline hit-testing |
 | `ui.playback` | `{action: play|stop|toggle, speed?}` | |
 | `ui.screenshot` | `{path?, panel?}` | PNG of the window or one panel; fails after 10 s when no frame is presented (window hidden, display asleep) |
-| `ui.resize`, `ui.focus`, `app.quit` | | `ui.focus` is the only request that activates the app and takes keyboard focus |
+| `ui.resize`, `ui.focus`, `app.quit` | `ui.resize {width, height}` | `ui.resize` sizes must be finite numbers and are clamped to 100–16384; `ui.focus` is the only request that activates the app and takes keyboard focus |
 | `perf.stats` | – | performance counters (also the command `perf.stats`, so `engine.execute` and MCP `command_run` reach it; headless sessions return the engine part). `decode`: GOP-cache requests / hits / `cacheHitRate`, decoder seeks, samples decoded and skipped while catching up, `draftFrames` (decoded in draft mode), `h264Threads` (frame-threading workers per H.264 decoder), `liveDecoders` (sources holding a decoder now), `cacheMB` / `cacheBudgetMB` (decoded frames all sources hold, and the shared budget), `planePoolMB` / `planesReused` (idle plane buffers of evicted frames, and planes decoded into a recycled one), decoder ms (total and per sample), `framesDecoded`, `hardware` (Settings ▸ Playback ▸ Hardware decoding: `enabled`, pictures from hardware decoders `frames` vs `softwareFrames`, `sessions`, `declined` streams, mid-stream `fallbacks`); `playback`: playing, shown / dropped frames and `dropRate` of the current or last play, resolution, `draftDecode` (Settings ▸ Playback ▸ Draft decoding), `audio` (desktop: sound is mixed 200 ms ahead of the device; device `callbacks`, `underruns` and `missingFrames` played as silence because the mixer fell behind, `minLeadMs` the least sound left buffered); `frames`: frame-worker jobs, cancelled, `requestHitRate`, `decodeMs` / `renderMs` (mean, p50, p95 of the last 256 jobs), queue, render-cost estimate, cache use; `ui`: fps and frame ms; `process`: CPU seconds; `media`, `jobs`. Counters are cumulative: diff two readings to measure an interval ([performance.md](performance.md)) |
 
 **Selection or explicit targets.** A command that acts on the selection is "not available right now" when
